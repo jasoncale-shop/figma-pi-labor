@@ -47,7 +47,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(realpathSync(fileURLToPath(import.meta.url)));
-const PROMPT_TEMPLATE = readFileSync(join(__dirname, "prompt.md"), "utf8");
+const PROMPT_PATH = join(__dirname, "prompt.md");
+const PROMPT_TEMPLATE = readFileSync(PROMPT_PATH, "utf8");
+const DISCONNECTED_PROMPT = `## Figma labor
+
+- figma-labor plugin: not connected. Labor tools fail until the user opens the plugin in Figma (Plugins → Development → figma-labor).
+- If the task involves Figma, call \`labor_list_files\` to recheck the connection before asking the user for screenshots or exports.
+- Once connected, read ${PROMPT_PATH} for Labor rules before the first canvas read or write. It is injected automatically from the next prompt on.`;
 
 const BRIDGE_URL = "http://127.0.0.1:3846";
 const BRIDGE_BIN = join(__dirname, "bridge.js");
@@ -940,8 +946,17 @@ export default function (pi: ExtensionAPI) {
     updateFooterStatus(ctx);
   });
 
-  // System prompt injection
+  // System prompt injection. The full Labor guide is ~10 KB; inject it only
+  // while the plugin is connected, and a pointer to it otherwise.
   pi.on("before_agent_start", async (event) => {
+    // The first prompt of a session can arrive before session_start's async
+    // status probe lands; ask the bridge directly instead of guessing.
+    const status = cachedStatus ?? (await bridgeStatus(500));
+    if (status?.plugin !== "connected") {
+      return {
+        systemPrompt: event.systemPrompt + "\n\n" + DISCONNECTED_PROMPT,
+      };
+    }
     const mcpAvailable = pi
       .getActiveTools()
       .some((toolName) =>
@@ -955,7 +970,7 @@ export default function (pi: ExtensionAPI) {
       );
     const prompt = PROMPT_TEMPLATE.replace(
       "{{plugin_status}}",
-      pluginStatusLabel(cachedStatus),
+      pluginStatusLabel(status),
     )
       .replace(
         "{{target_file}}",

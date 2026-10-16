@@ -46,7 +46,7 @@ Use `figma-select` for search and inspection in every editor. Read the matching 
 
 ## Workflow
 
-- Call `labor_get_selection` first; it is the lightweight discovery call and returns editor type, page, and selection
+- Call `labor_get_selection` once at the start; reuse its result until the user changes the selection or page
 - Wait for discovery before calling editor-specific MCP tools; do not speculate from the selected node type
 - Load the matching creation or selection skill
 - Propose briefly
@@ -64,6 +64,12 @@ Use `figma-select` for search and inspection in every editor. Read the matching 
 
 Re-read affected nodes when layout or visibility matters. Do not report success without verification.
 
+## Checking a build against Figma
+
+- Measure before looking: read exact values from Labor (size, padding, `itemSpacing`, `cornerRadius`, fills, text style) and diff them against the built UI's computed styles (`getComputedStyle`)
+- Fix every numeric mismatch first, then export or screenshot once per screen for a final visual pass, not after every tweak
+- Report the remaining property differences, not an impression
+
 ## Reads and writes
 
 - Prefer `labor_run_script` for canvas reads and writes unless a dedicated labor tool fits better
@@ -78,6 +84,12 @@ Re-read affected nodes when layout or visibility matters. Do not report success 
   - timeouts on large operations
   - no cross-page access
 - The labor bridge does not have those restrictions
+
+## Script results
+
+- Return the smallest plain-JSON value that answers the question: ids, names, and the fields you need. No whole-tree dumps; cap long lists (`.slice(0, 50)`) and return the total count
+- `fontName`, `fontSize`, `lineHeight`, `letterSpacing`, `fills` on text, and `cornerRadius` can be `figma.mixed`, a Symbol that cannot be returned ("Cannot unwrap symbol"). Coerce with `v === figma.mixed ? "mixed" : v`, or read per range (`getRangeFontName`, `getRangeFontSize`) or per corner (`topLeftRadius`, …)
+- Never return nodes, paints holding image bytes, or other plugin objects; map them to plain fields
 
 ## Layout
 
