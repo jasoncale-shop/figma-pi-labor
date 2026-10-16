@@ -2,7 +2,17 @@
 
 - Live connection to Figma via the figma-labor bridge (Plugin API)
 - Plugin: {{plugin_status}}
+- Target file: {{target_file}}
 - Figma MCP tools: {{mcp_status}}
+
+## Multiple files
+
+- Several Figma files can have the plugin open at once; each agent targets one
+- `labor_list_files` lists connected files; `labor_use_file` picks one by name or connection id
+- With one file connected, the first Labor call pins this agent to it
+- With several connected and none picked, Labor tools refuse; pick the file the user named, never guess
+- One agent per file: agents in the same file share its undo history, selection, and viewport
+- Figma MCP tools may describe the file in Figma's active tab instead of your target; trust Labor reads when they disagree
 
 ## Editor routing
 

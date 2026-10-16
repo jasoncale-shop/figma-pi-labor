@@ -33,6 +33,8 @@
  *   labor_detach_instance     Detach an instance, converting it to a plain frame
  *   labor_run_script          Run arbitrary JS in the Figma plugin context
  *   labor_undo                Undo the last operation
+ *   labor_list_files          List connected Figma files and this agent's target
+ *   labor_use_file            Point this agent's tools at one connected file
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -41,6 +43,7 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(realpathSync(fileURLToPath(import.meta.url)));
@@ -70,20 +73,38 @@ interface PluginContext {
   slidesMode?: "grid" | "single-slide";
 }
 
+/** One Figma file with the plugin open, as reported by the bridge. */
+interface BridgeFile {
+  id: string;
+  file: string | null;
+  editorType: EditorType | null;
+  page: { id: string; name: string } | null;
+  selectionCount: number | null;
+}
+
 interface BridgeStatus {
   bridge: string;
   plugin: string;
+  /** Only set when exactly one file is connected. */
   context: PluginContext | null;
+  /** Missing on bridges that predate multi-file support. */
+  files?: BridgeFile[];
 }
 
 let bridgeProc: ChildProcess | null = null;
 let bridgeStartedByUs = false;
 let cachedStatus: BridgeStatus | null = null;
 
-function footerSymbols(pluginConnected: boolean, mcpReady: boolean): string {
-  const plugin = pluginConnected ? "P" : "◌";
+function footerSymbols(fileCount: number, mcpReady: boolean): string {
+  const plugin =
+    fileCount === 0 ? "◌" : fileCount === 1 ? "P" : `P${fileCount}`;
   const mcp = mcpReady ? "M" : "◌";
   return `${plugin} ${mcp}`;
+}
+
+function connectedFileCount(status: BridgeStatus): number {
+  if (status.plugin !== "connected") return 0;
+  return status.files?.length || 1;
 }
 
 function isStaleSessionContextError(error: unknown): boolean {
@@ -103,10 +124,9 @@ function updateFooterStatus(ctx: {
       ctx.ui.setStatus("labor", undefined);
       return true;
     }
-    const pluginConnected = cachedStatus.plugin === "connected";
     ctx.ui.setStatus(
       "labor",
-      `labor ${footerSymbols(pluginConnected, mcpConnected)}`,
+      `labor ${footerSymbols(connectedFileCount(cachedStatus), mcpConnected)}`,
     );
     return true;
   } catch (error) {
@@ -128,20 +148,36 @@ async function bridgeStatus(timeout = 2000): Promise<BridgeStatus | null> {
   }
 }
 
+function fileLabel(file: BridgeFile): string {
+  const name = file.file === null ? "unidentified file" : `"${file.file}"`;
+  return `${name} (${file.id})`;
+}
+
 function pluginStatusLabel(status: BridgeStatus | null): string {
   if (!status) return "disconnected";
+  const files = status.files ?? [];
+  if (files.length > 1) {
+    return `${status.plugin} (${files.length} files: ${files.map(fileLabel).join(", ")})`;
+  }
   const editor = status.context?.editorType;
   return editor ? `${status.plugin} (${editor})` : status.plugin;
 }
 
 // ## BRIDGE COMMAND HELPERS
 
-// Send a command to the bridge server
+interface BridgeCommandResult {
+  result: unknown;
+  /** The file that ran the command. */
+  file: BridgeFile | null;
+}
+
+// Send a command to the bridge server. `target` is a file name or connection
+// id; null lets the bridge use the only connected file.
 async function bridgeCommand(
   command: string,
   params: Record<string, unknown>,
-  opts?: { timeout?: number; signal?: AbortSignal },
-): Promise<unknown> {
+  opts?: { timeout?: number; signal?: AbortSignal; target?: string | null },
+): Promise<BridgeCommandResult> {
   const timeoutMs = opts?.timeout ?? 35_000;
   const httpTimeoutSignal = AbortSignal.timeout(timeoutMs + 5_000); // HTTP timeout > bridge timeout
   const signal = opts?.signal
@@ -150,20 +186,33 @@ async function bridgeCommand(
   const res = await fetch(`${BRIDGE_URL}/command`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command, params, timeout: opts?.timeout }),
+    body: JSON.stringify({
+      command,
+      params,
+      timeout: opts?.timeout,
+      target: opts?.target ?? undefined,
+    }),
     signal,
   });
-  const json = (await res.json()) as { result?: unknown; error?: string };
+  const json = (await res.json()) as {
+    result?: unknown;
+    error?: string;
+    file?: BridgeFile;
+  };
   if (json.error) throw new Error(json.error);
-  return json.result;
+  return { result: json.result, file: json.file ?? null };
 }
 
 // Send an undo command to the bridge server
-async function bridgeUndo(): Promise<void> {
-  await fetch(`${BRIDGE_URL}/undo`, {
+async function bridgeUndo(target: string | null): Promise<void> {
+  const res = await fetch(`${BRIDGE_URL}/undo`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target: target ?? undefined }),
     signal: AbortSignal.timeout(5000),
   });
+  const json = (await res.json()) as { error?: string };
+  if (json.error) throw new Error(json.error);
 }
 
 // Start the bridge server
@@ -211,18 +260,60 @@ function stopBridge() {
   bridgeStartedByUs = false;
 }
 
+// Plugins reconnect to a restarted bridge within a few seconds.
+const PLUGIN_RECONNECT_WAIT_MS = 10_000;
+
+function hasTargetFile(status: BridgeStatus, target: string | null): boolean {
+  if (status.plugin !== "connected") return false;
+  if (target === null) return true;
+  return (status.files ?? []).some(
+    (file) => file.file === target || file.id === target,
+  );
+}
+
+// After restarting the bridge, wait for the target file's plugin to reconnect.
+async function waitForPlugin(
+  target: string | null,
+  signal?: AbortSignal,
+): Promise<BridgeStatus | null> {
+  const deadline = Date.now() + PLUGIN_RECONNECT_WAIT_MS;
+  let status = await bridgeStatus();
+  while (
+    status &&
+    !hasTargetFile(status, target) &&
+    Date.now() < deadline &&
+    !signal?.aborted
+  ) {
+    await delay(500);
+    status = await bridgeStatus();
+  }
+  return status;
+}
+
 // ## TOOL HELPERS
 
-async function runTool(
+interface BridgeToolOptions {
+  timeout?: number;
+  signal?: AbortSignal;
+  includeContext?: boolean;
+  /** File name or connection id; null lets the bridge use the only connected file. */
+  target?: string | null;
+  /** Called with the file that ran the command. */
+  onFile?: (file: BridgeFile) => void;
+}
+
+async function runBridgeTool(
   command: string,
   params: Record<string, unknown>,
-  opts?: {
-    timeout?: number;
-    signal?: AbortSignal;
-    includeContext?: boolean;
-  },
+  opts?: BridgeToolOptions,
 ) {
-  const status = await bridgeStatus();
+  let status = await bridgeStatus();
+
+  // The bridge exits with the session that started it. Restart it so other
+  // sessions keep working, and give the plugins time to reconnect to it.
+  if (!status && (await startBridge(opts?.signal))) {
+    status = await waitForPlugin(opts?.target ?? null, opts?.signal);
+  }
 
   // Handle connection errors
   if (!status) {
@@ -230,7 +321,7 @@ async function runTool(
       content: [
         {
           type: "text" as const,
-          text: "figma-labor bridge is not running. Start pi fresh or run the bridge manually: cd ~/Git/figma-labor/bridge && npm start",
+          text: "figma-labor bridge is not running and could not be started. Run /figma-labor-start.",
         },
       ],
       isError: true,
@@ -253,7 +344,8 @@ async function runTool(
 
   // Execute command
   try {
-    const result = await bridgeCommand(command, params, opts);
+    const { result, file } = await bridgeCommand(command, params, opts);
+    if (file) opts?.onFile?.(file);
     const errorMessage =
       typeof result === "string" && result.startsWith("figma-labor error:")
         ? result
@@ -271,8 +363,9 @@ async function runTool(
     }
     const output = opts?.includeContext
       ? {
-          editorType: status.context?.editorType ?? null,
-          page: status.context?.page ?? null,
+          file: file?.file ?? null,
+          editorType: file?.editorType ?? status.context?.editorType ?? null,
+          page: file?.page ?? status.context?.page ?? null,
           selection: result,
         }
       : result;
@@ -756,6 +849,26 @@ export default function (pi: ExtensionAPI) {
   let bridgeSessionRun = 0;
   let bridgeStartupAbort: AbortController | null = null;
 
+  // File this agent's Labor tools target: a file name, or a connection id when
+  // the name is ambiguous. Each agent (subagents included) gets its own. The
+  // first command that runs with a single connected file pins it, so a file
+  // connecting later can't redirect this agent's writes.
+  let targetFile: string | null = null;
+
+  function runTool(
+    command: string,
+    params: Record<string, unknown>,
+    opts?: Omit<BridgeToolOptions, "target" | "onFile">,
+  ) {
+    return runBridgeTool(command, params, {
+      ...opts,
+      target: targetFile,
+      onFile: (file) => {
+        targetFile ??= file.file ?? file.id;
+      },
+    });
+  }
+
   function isCurrentBridgeSession(run: number, signal: AbortSignal): boolean {
     return run === bridgeSessionRun && !signal.aborted;
   }
@@ -796,6 +909,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    targetFile = null;
     bridgeStartupAbort?.abort();
     const run = ++bridgeSessionRun;
     const controller = new AbortController();
@@ -842,7 +956,12 @@ export default function (pi: ExtensionAPI) {
     const prompt = PROMPT_TEMPLATE.replace(
       "{{plugin_status}}",
       pluginStatusLabel(cachedStatus),
-    ).replace("{{mcp_status}}", mcpAvailable ? "available" : "unavailable");
+    )
+      .replace(
+        "{{target_file}}",
+        targetFile === null ? "none yet" : `"${targetFile}"`,
+      )
+      .replace("{{mcp_status}}", mcpAvailable ? "available" : "unavailable");
     return {
       systemPrompt: event.systemPrompt + "\n\n" + prompt,
     };
@@ -909,10 +1028,19 @@ export default function (pi: ExtensionAPI) {
         );
         return;
       }
+      const files = status.files ?? [];
       const context = status.context;
-      const details = context
-        ? `\nEditor: ${context.editorType}\nPage: ${context.page.name}\nSelection: ${context.selectionCount}`
-        : "";
+      const details =
+        files.length > 1
+          ? `\nFiles:\n${files
+              .map(
+                (file) =>
+                  `  • ${fileLabel(file)}, page "${file.page?.name ?? "?"}"${file.file === targetFile || file.id === targetFile ? " ← this session" : ""}`,
+              )
+              .join("\n")}`
+          : context
+            ? `\nEditor: ${context.editorType}\nPage: ${context.page.name}\nSelection: ${context.selectionCount}`
+            : "";
       ctx.ui.notify(
         `figma-labor bridge: ${status.bridge}\nFigma plugin: ${status.plugin}${details}`,
         status.plugin === "connected" ? "success" : "info",
@@ -921,6 +1049,97 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Tools
+
+  // ## Files
+
+  pi.registerTool({
+    name: "labor_list_files",
+    label: "List Files",
+    description:
+      "List the Figma files that have the Labor plugin open, and which one this agent's Labor tools target.",
+    parameters: Type.Object({}),
+    async execute() {
+      const status = await bridgeStatus();
+      if (!status) {
+        return {
+          content: [
+            { type: "text" as const, text: "figma-labor bridge is not running." },
+          ],
+          isError: true,
+        };
+      }
+      if (!status.files) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "The running figma-labor bridge predates multi-file support. Stop its bridge.js process so the extension can start the current one.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { target: targetFile, files: status.files },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "labor_use_file",
+    label: "Use File",
+    description:
+      "Point this agent's Labor tools at one connected Figma file, by file name or connection id from labor_list_files. Required when several files are connected.",
+    parameters: Type.Object({
+      file: Type.String({
+        description: "Exact file name, or connection id from labor_list_files",
+      }),
+    }),
+    async execute(_id, params) {
+      const files = (await bridgeStatus())?.files ?? [];
+      const sameName = files.filter((file) => file.file === params.file);
+      const match =
+        files.find((file) => file.id === params.file) ??
+        (sameName.length === 1 ? sameName[0] : undefined);
+      if (!match) {
+        const reason =
+          sameName.length > 1
+            ? `Several connected files are named "${params.file}"; use a connection id.`
+            : `No connected Figma file matches "${params.file}".`;
+        const connected = files.length
+          ? files.map(fileLabel).join(", ")
+          : "none";
+        return {
+          content: [
+            { type: "text" as const, text: `${reason} Connected: ${connected}.` },
+          ],
+          isError: true,
+        };
+      }
+      // Prefer the name: it survives plugin reconnects, which change the id.
+      const nameIsUnique =
+        match.file !== null &&
+        files.filter((file) => file.file === match.file).length === 1;
+      targetFile = nameIsUnique ? match.file : match.id;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Labor tools now target ${fileLabel(match)}: ${match.editorType ?? "unknown"} editor, page "${match.page?.name ?? "?"}".`,
+          },
+        ],
+      };
+    },
+  });
 
   // ## Selection & navigation
 
@@ -1581,7 +1800,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       try {
-        await bridgeUndo();
+        await bridgeUndo(targetFile);
         return { content: [{ type: "text" as const, text: "Undo applied." }] };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

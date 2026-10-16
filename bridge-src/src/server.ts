@@ -1,18 +1,25 @@
 /**
  * figma-labor bridge server
  *
- * Relays commands between the pi extension (HTTP) and the Figma plugin (WebSocket).
+ * Relays commands between the pi extension (HTTP) and Figma plugin instances
+ * (WebSocket). Every Figma file with the plugin open keeps its own connection,
+ * so several agents can work in different files at once.
  *
  * Endpoints:
  *   POST /command    — send a command, waits for plugin response (sync)
  *   POST /undo       — send an undo command to the plugin
- *   GET  /status     — check bridge + plugin connection status
+ *   GET  /status     — bridge status plus every connected file
+ *
+ * Targeting (optional `target` in POST bodies):
+ *   connection id (e.g. "c3-4f1a") or exact file name. Without a target the
+ *   command goes to the only connected file, and is refused when several
+ *   files are connected, so a write never lands in a guessed file.
  *
  * Protocol:
- *   pi sends:        { id, command, params }
+ *   pi sends:        { command, params, timeout?, target? }
  *   plugin receives: { id, command, params }
  *   plugin sends:    { id, result } | { id, error }
- *   pi receives:     { result } | { error }
+ *   pi receives:     { result, file } | { error }
  */
 
 import http from "node:http";
@@ -21,6 +28,14 @@ import { randomUUID } from "node:crypto";
 
 const PORT = 3846;
 const COMMAND_TIMEOUT_MS = 30_000;
+const IDENTIFY_TIMEOUT_MS = 10_000;
+
+// The plugin's hello carries no file identity, so the bridge asks each instance
+// for its file name and an instance id stored in the plugin's globals. The
+// instance id survives socket reconnects, which lets the bridge drop the stale
+// socket when the same plugin instance connects again.
+const IDENTIFY_SCRIPT =
+  "globalThis.__laborInstanceId ??= Math.random().toString(36).slice(2); return { file: figma.root.name, instance: globalThis.__laborInstanceId };";
 
 // ## Types
 
@@ -46,28 +61,104 @@ interface PluginMessage {
   error?: string;
 }
 
+interface PluginConnection {
+  id: string;
+  ws: WebSocket;
+  context: PluginContext | null;
+  file: string | null;
+  instance: string | null;
+  identifying: boolean;
+}
+
+interface FileInfo {
+  id: string;
+  file: string | null;
+  editorType: PluginContext["editorType"] | null;
+  page: PluginContext["page"] | null;
+  selectionCount: number | null;
+}
+
 interface PendingCommand {
+  connectionId: string;
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: NodeJS.Timeout;
 }
 
 // ## State
 
-let pluginSocket: WebSocket | null = null;
-let pluginContext: PluginContext | null = null;
+const connections = new Map<string, PluginConnection>();
 const pending = new Map<string, PendingCommand>();
+let nextConnectionId = 1;
+// Ids must not repeat across bridge restarts: an agent pinned to an id from the
+// previous bridge must be refused, not matched to whichever file reconnected
+// first under the same number.
+const BRIDGE_RUN = randomUUID().slice(0, 4);
+
+// ## Connections
+
+function openConnections(): PluginConnection[] {
+  return [...connections.values()].filter(
+    (conn) => conn.ws.readyState === WebSocket.OPEN,
+  );
+}
+
+function describe(conn: PluginConnection): FileInfo {
+  return {
+    id: conn.id,
+    file: conn.file,
+    editorType: conn.context?.editorType ?? null,
+    page: conn.context?.page ?? null,
+    selectionCount: conn.context?.selectionCount ?? null,
+  };
+}
+
+function label(conn: PluginConnection): string {
+  const name = conn.file === null ? "unidentified file" : `"${conn.file}"`;
+  return `${name} (${conn.id})`;
+}
+
+function resolveTarget(target: string | undefined): PluginConnection {
+  const open = openConnections();
+  if (open.length === 0) {
+    throw new Error(
+      "Figma plugin is not connected. Make sure the plugin is open in Figma.",
+    );
+  }
+  const connected = open.map(label).join(", ");
+
+  if (!target) {
+    if (open.length === 1) return open[0];
+    throw new Error(
+      `${open.length} Figma files are connected: ${connected}. Pick one with labor_use_file.`,
+    );
+  }
+
+  const byId = open.find((conn) => conn.id === target);
+  if (byId) return byId;
+
+  const byName = open.filter((conn) => conn.file === target);
+  if (byName.length === 1) return byName[0];
+  if (byName.length > 1) {
+    throw new Error(
+      `Several connected files are named "${target}": ${byName.map((conn) => conn.id).join(", ")}. Target one by id.`,
+    );
+  }
+  throw new Error(
+    `No connected Figma file matches "${target}". Connected: ${connected}.`,
+  );
+}
 
 // ## Plugin communication
 
-function sendToPlugin(command: Command, timeoutMs?: number): Promise<unknown> {
+function sendToPlugin(
+  conn: PluginConnection,
+  command: Command,
+  timeoutMs?: number,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    if (!pluginSocket || pluginSocket.readyState !== WebSocket.OPEN) {
-      reject(
-        new Error(
-          "Figma plugin is not connected. Make sure the plugin is open in Figma.",
-        ),
-      );
+    if (conn.ws.readyState !== WebSocket.OPEN) {
+      reject(new Error(`Figma file ${label(conn)} disconnected.`));
       return;
     }
 
@@ -81,9 +172,55 @@ function sendToPlugin(command: Command, timeoutMs?: number): Promise<unknown> {
       );
     }, effectiveTimeout);
 
-    pending.set(command.id, { resolve, reject, timer });
-    pluginSocket.send(JSON.stringify(command));
+    pending.set(command.id, {
+      connectionId: conn.id,
+      resolve,
+      reject,
+      timer,
+    });
+    conn.ws.send(JSON.stringify(command));
   });
+}
+
+async function identify(conn: PluginConnection): Promise<void> {
+  conn.identifying = true;
+  try {
+    const result = await sendToPlugin(
+      conn,
+      {
+        id: randomUUID(),
+        command: "run_script",
+        params: { code: IDENTIFY_SCRIPT },
+      },
+      IDENTIFY_TIMEOUT_MS,
+    );
+    if (!result || typeof result !== "object") {
+      throw new Error(`unexpected identify result: ${JSON.stringify(result)}`);
+    }
+    const file = "file" in result ? result.file : undefined;
+    const instance = "instance" in result ? result.instance : undefined;
+    conn.file = typeof file === "string" ? file : null;
+    conn.instance = typeof instance === "string" ? instance : null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[bridge] Could not identify ${conn.id}: ${message}`);
+    return;
+  } finally {
+    conn.identifying = false;
+  }
+
+  console.log(`[bridge] ${conn.id} is ${label(conn)}`);
+  if (!conn.instance) return;
+
+  // Same plugin instance on a newer socket: forget the older one. Don't
+  // terminate it; terminating triggers onclose in the plugin UI, which causes a
+  // reconnect loop. It closes on its own.
+  for (const other of connections.values()) {
+    if (other.id !== conn.id && other.instance === conn.instance) {
+      connections.delete(other.id);
+      console.log(`[bridge] ${other.id} replaced by ${conn.id}`);
+    }
+  }
 }
 
 // ## HTTP helpers
@@ -112,6 +249,31 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown) {
   res.end(json);
 }
 
+interface CommandRequest {
+  command?: string;
+  params: Record<string, unknown>;
+  timeout?: number;
+  target?: string;
+}
+
+function parseCommandRequest(body: unknown): CommandRequest {
+  const fields: Record<string, unknown> =
+    body && typeof body === "object" ? { ...body } : {};
+  const params =
+    fields.params && typeof fields.params === "object"
+      ? (fields.params as Record<string, unknown>)
+      : {};
+  return {
+    command: typeof fields.command === "string" ? fields.command : undefined,
+    params,
+    timeout: typeof fields.timeout === "number" ? fields.timeout : undefined,
+    target:
+      typeof fields.target === "string" && fields.target !== ""
+        ? fields.target
+        : undefined,
+  };
+}
+
 // ## HTTP server
 
 const httpServer = http.createServer(async (req, res) => {
@@ -126,19 +288,19 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && req.url === "/status") {
+    const open = openConnections();
     sendJson(res, 200, {
       bridge: "running",
-      plugin:
-        pluginSocket?.readyState === WebSocket.OPEN
-          ? "connected"
-          : "disconnected",
-      context: pluginContext,
+      plugin: open.length > 0 ? "connected" : "disconnected",
+      // Only unambiguous with a single file; use `files` otherwise.
+      context: open.length === 1 ? open[0].context : null,
+      files: open.map(describe),
       pending: pending.size,
     });
     return;
   }
 
-  if (req.method === "POST" && req.url === "/command") {
+  if (req.method === "POST" && (req.url === "/command" || req.url === "/undo")) {
     let body: unknown;
     try {
       body = await readBody(req);
@@ -147,36 +309,32 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
-    const {
-      command,
-      params = {},
-      timeout,
-    } = body as {
-      command?: string;
-      params?: Record<string, unknown>;
-      timeout?: number;
-    };
-    if (!command) {
+    const { command, params, timeout, target } = parseCommandRequest(body);
+    const effectiveCommand = req.url === "/undo" ? "undo" : command;
+    if (!effectiveCommand) {
       sendJson(res, 400, { error: "Missing required field: command" });
       return;
     }
 
-    const id = randomUUID();
+    let conn: PluginConnection;
     try {
-      const result = await sendToPlugin({ id, command, params }, timeout);
-      sendJson(res, 200, { result });
+      conn = resolveTarget(target);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      sendJson(res, 503, { error: message });
+      sendJson(res, 409, { error: message });
+      return;
     }
-    return;
-  }
 
-  if (req.method === "POST" && req.url === "/undo") {
-    const id = randomUUID();
     try {
-      await sendToPlugin({ id, command: "undo", params: {} });
-      sendJson(res, 200, { result: "undo applied" });
+      const result = await sendToPlugin(
+        conn,
+        { id: randomUUID(), command: effectiveCommand, params },
+        timeout,
+      );
+      sendJson(res, 200, {
+        result: req.url === "/undo" ? "undo applied" : result,
+        file: describe(conn),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sendJson(res, 503, { error: message });
@@ -192,15 +350,16 @@ const httpServer = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on("connection", (ws) => {
-  if (pluginSocket && pluginSocket.readyState === WebSocket.OPEN) {
-    console.log("[bridge] New plugin connected, replacing previous connection");
-    // Don't terminate — let the old socket die naturally.
-    // Terminating triggers onclose in the plugin UI which causes a reconnect loop.
-  }
-
-  pluginSocket = ws;
-  pluginContext = null;
-  console.log("[bridge] Figma plugin connected");
+  const conn: PluginConnection = {
+    id: `c${nextConnectionId++}-${BRIDGE_RUN}`,
+    ws,
+    context: null,
+    file: null,
+    instance: null,
+    identifying: false,
+  };
+  connections.set(conn.id, conn);
+  console.log(`[bridge] Figma plugin connected (${conn.id})`);
 
   ws.on("message", (data) => {
     let msg: PluginMessage;
@@ -213,8 +372,8 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "ping") return;
     if (msg.type === "hello" && msg.context) {
-      pluginContext = msg.context;
-      console.log(`[bridge] Plugin context: ${msg.context.editorType}`);
+      conn.context = msg.context;
+      if (conn.file === null && !conn.identifying) void identify(conn);
       return;
     }
     if (!msg.id) {
@@ -242,26 +401,24 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    console.log("[bridge] Figma plugin disconnected");
-    if (pluginSocket === ws) {
-      pluginSocket = null;
-      pluginContext = null;
-    }
+    console.log(`[bridge] Figma plugin disconnected: ${label(conn)}`);
+    if (connections.get(conn.id) === conn) connections.delete(conn.id);
 
     for (const [id, p] of pending) {
+      if (p.connectionId !== conn.id) continue;
       clearTimeout(p.timer);
-      p.reject(new Error("Figma plugin disconnected"));
+      p.reject(new Error(`Figma file ${label(conn)} disconnected`));
       pending.delete(id);
     }
   });
 
   ws.on("error", (err) => {
-    console.error("[bridge] Plugin WebSocket error:", err.message);
+    console.error(`[bridge] Plugin WebSocket error (${conn.id}):`, err.message);
   });
 });
 
 // ## Start
-// To rebuild the bundled server for the extension: cd figma-bridge && npm run build
+// To rebuild the bundled server for the extension: cd bridge-src && npm run build
 
 httpServer.listen(PORT, "127.0.0.1", () => {
   console.log(`[bridge] Running on http://127.0.0.1:${PORT}`);
@@ -273,11 +430,16 @@ httpServer.on("error", (err) => {
   process.exit(1);
 });
 
-process.on("SIGTERM", () => {
+// httpServer.close() alone never finishes while plugin sockets are open, which
+// left a stopped bridge holding every plugin connection. Drop the sockets so
+// each plugin reconnects to the next bridge, then exit.
+function shutdown() {
   console.log("[bridge] Shutting down...");
+  for (const ws of wss.clients) ws.terminate();
+  httpServer.closeAllConnections();
   httpServer.close(() => process.exit(0));
-});
+  setTimeout(() => process.exit(0), 1000).unref();
+}
 
-process.on("SIGINT", () => {
-  httpServer.close(() => process.exit(0));
-});
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
