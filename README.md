@@ -47,7 +47,7 @@ FIGMA_MCP_PORT=3845 pi
 | -------------------- | ----------------------------------------------------- |
 | `/figma-labor-start` | Start bridge server manually                          |
 | `/figma-labor-stop`  | Stop bridge server manually                           |
-| `/figma-labor`       | Show bridge status and Figma plugin connection status |
+| `/figma-labor`       | Show bridge status and connected Figma files          |
 | `/figma-mcp`         | Show Figma MCP server status and list available tools |
 
 ### Footer status
@@ -57,7 +57,18 @@ FIGMA_MCP_PORT=3845 pi
 labor ◌ ◌     bridge running, but plugin and MCP are not working
 labor ◌ M     MCP working (Figma is open and MCP is enabled)
 labor P M     plugin is running and MCP is working
+labor P2 M    plugin is open in 2 files
 ```
+
+### Multiple files
+
+Open _Pi Labor_ in several files and run one agent per file. The bridge keeps a connection per file, and each agent (subagents included) targets one:
+
+- `labor_list_files` lists the connected files; `labor_use_file` picks one by name or connection id
+- With a single file connected, an agent's first Labor call pins it to that file, so a file opened later can't redirect its writes
+- With several files connected and none picked, Labor tools refuse instead of guessing
+- Agents in the same file share its undo history, selection, and viewport
+- The desktop Figma MCP may describe the file in the active tab rather than the agent's target
 
 ## MCP ↔ Labor
 
@@ -99,6 +110,8 @@ MCP tools are preferred for reading. If MCP is unavailable, Labor will use Figma
 | `labor_detach_instance`           | Detach a component instance into a plain frame                 |
 | `labor_run_script`                | Run arbitrary JavaScript in the Figma plugin context           |
 | `labor_undo`                      | Undo the last operation                                        |
+| `labor_list_files`                | List connected Figma files and this agent's target             |
+| `labor_use_file`                  | Point this agent's Labor tools at one connected file           |
 
 Tools are registered when the desktop MCP server is enabled. `/figma-mcp` to see available tools.
 

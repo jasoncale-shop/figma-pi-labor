@@ -3655,17 +3655,61 @@ var import_websocket_server = __toESM(require_websocket_server(), 1);
 var import_node_crypto = require("node:crypto");
 var PORT = 3846;
 var COMMAND_TIMEOUT_MS = 3e4;
-var pluginSocket = null;
-var pluginContext = null;
+var IDENTIFY_TIMEOUT_MS = 1e4;
+var IDENTIFY_SCRIPT = "globalThis.__laborInstanceId ??= Math.random().toString(36).slice(2); return { file: figma.root.name, instance: globalThis.__laborInstanceId };";
+var connections = /* @__PURE__ */ new Map();
 var pending = /* @__PURE__ */ new Map();
-function sendToPlugin(command, timeoutMs) {
+var nextConnectionId = 1;
+var BRIDGE_RUN = (0, import_node_crypto.randomUUID)().slice(0, 4);
+function openConnections() {
+  return [...connections.values()].filter(
+    (conn) => conn.ws.readyState === import_websocket.default.OPEN
+  );
+}
+function describe(conn) {
+  return {
+    id: conn.id,
+    file: conn.file,
+    editorType: conn.context?.editorType ?? null,
+    page: conn.context?.page ?? null,
+    selectionCount: conn.context?.selectionCount ?? null
+  };
+}
+function label(conn) {
+  const name = conn.file === null ? "unidentified file" : `"${conn.file}"`;
+  return `${name} (${conn.id})`;
+}
+function resolveTarget(target) {
+  const open = openConnections();
+  if (open.length === 0) {
+    throw new Error(
+      "Figma plugin is not connected. Make sure the plugin is open in Figma."
+    );
+  }
+  const connected = open.map(label).join(", ");
+  if (!target) {
+    if (open.length === 1) return open[0];
+    throw new Error(
+      `${open.length} Figma files are connected: ${connected}. Pick one with labor_use_file.`
+    );
+  }
+  const byId = open.find((conn) => conn.id === target);
+  if (byId) return byId;
+  const byName = open.filter((conn) => conn.file === target);
+  if (byName.length === 1) return byName[0];
+  if (byName.length > 1) {
+    throw new Error(
+      `Several connected files are named "${target}": ${byName.map((conn) => conn.id).join(", ")}. Target one by id.`
+    );
+  }
+  throw new Error(
+    `No connected Figma file matches "${target}". Connected: ${connected}.`
+  );
+}
+function sendToPlugin(conn, command, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!pluginSocket || pluginSocket.readyState !== import_websocket.default.OPEN) {
-      reject(
-        new Error(
-          "Figma plugin is not connected. Make sure the plugin is open in Figma."
-        )
-      );
+    if (conn.ws.readyState !== import_websocket.default.OPEN) {
+      reject(new Error(`Figma file ${label(conn)} disconnected.`));
       return;
     }
     const effectiveTimeout = timeoutMs ?? COMMAND_TIMEOUT_MS;
@@ -3677,9 +3721,49 @@ function sendToPlugin(command, timeoutMs) {
         )
       );
     }, effectiveTimeout);
-    pending.set(command.id, { resolve, reject, timer });
-    pluginSocket.send(JSON.stringify(command));
+    pending.set(command.id, {
+      connectionId: conn.id,
+      resolve,
+      reject,
+      timer
+    });
+    conn.ws.send(JSON.stringify(command));
   });
+}
+async function identify(conn) {
+  conn.identifying = true;
+  try {
+    const result = await sendToPlugin(
+      conn,
+      {
+        id: (0, import_node_crypto.randomUUID)(),
+        command: "run_script",
+        params: { code: IDENTIFY_SCRIPT }
+      },
+      IDENTIFY_TIMEOUT_MS
+    );
+    if (!result || typeof result !== "object") {
+      throw new Error(`unexpected identify result: ${JSON.stringify(result)}`);
+    }
+    const file = "file" in result ? result.file : void 0;
+    const instance = "instance" in result ? result.instance : void 0;
+    conn.file = typeof file === "string" ? file : null;
+    conn.instance = typeof instance === "string" ? instance : null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[bridge] Could not identify ${conn.id}: ${message}`);
+    return;
+  } finally {
+    conn.identifying = false;
+  }
+  console.log(`[bridge] ${conn.id} is ${label(conn)}`);
+  if (!conn.instance) return;
+  for (const other of connections.values()) {
+    if (other.id !== conn.id && other.instance === conn.instance) {
+      connections.delete(other.id);
+      console.log(`[bridge] ${other.id} replaced by ${conn.id}`);
+    }
+  }
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -3703,6 +3787,16 @@ function sendJson(res, status, body) {
   });
   res.end(json);
 }
+function parseCommandRequest(body) {
+  const fields = body && typeof body === "object" ? { ...body } : {};
+  const params = fields.params && typeof fields.params === "object" ? fields.params : {};
+  return {
+    command: typeof fields.command === "string" ? fields.command : void 0,
+    params,
+    timeout: typeof fields.timeout === "number" ? fields.timeout : void 0,
+    target: typeof fields.target === "string" && fields.target !== "" ? fields.target : void 0
+  };
+}
 var httpServer = import_node_http.default.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -3713,15 +3807,18 @@ var httpServer = import_node_http.default.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && req.url === "/status") {
+    const open = openConnections();
     sendJson(res, 200, {
       bridge: "running",
-      plugin: pluginSocket?.readyState === import_websocket.default.OPEN ? "connected" : "disconnected",
-      context: pluginContext,
+      plugin: open.length > 0 ? "connected" : "disconnected",
+      // Only unambiguous with a single file; use `files` otherwise.
+      context: open.length === 1 ? open[0].context : null,
+      files: open.map(describe),
       pending: pending.size
     });
     return;
   }
-  if (req.method === "POST" && req.url === "/command") {
+  if (req.method === "POST" && (req.url === "/command" || req.url === "/undo")) {
     let body;
     try {
       body = await readBody(req);
@@ -3729,30 +3826,30 @@ var httpServer = import_node_http.default.createServer(async (req, res) => {
       sendJson(res, 400, { error: "Invalid JSON body" });
       return;
     }
-    const {
-      command,
-      params = {},
-      timeout
-    } = body;
-    if (!command) {
+    const { command, params, timeout, target } = parseCommandRequest(body);
+    const effectiveCommand = req.url === "/undo" ? "undo" : command;
+    if (!effectiveCommand) {
       sendJson(res, 400, { error: "Missing required field: command" });
       return;
     }
-    const id = (0, import_node_crypto.randomUUID)();
+    let conn;
     try {
-      const result = await sendToPlugin({ id, command, params }, timeout);
-      sendJson(res, 200, { result });
+      conn = resolveTarget(target);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      sendJson(res, 503, { error: message });
+      sendJson(res, 409, { error: message });
+      return;
     }
-    return;
-  }
-  if (req.method === "POST" && req.url === "/undo") {
-    const id = (0, import_node_crypto.randomUUID)();
     try {
-      await sendToPlugin({ id, command: "undo", params: {} });
-      sendJson(res, 200, { result: "undo applied" });
+      const result = await sendToPlugin(
+        conn,
+        { id: (0, import_node_crypto.randomUUID)(), command: effectiveCommand, params },
+        timeout
+      );
+      sendJson(res, 200, {
+        result: req.url === "/undo" ? "undo applied" : result,
+        file: describe(conn)
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sendJson(res, 503, { error: message });
@@ -3763,12 +3860,16 @@ var httpServer = import_node_http.default.createServer(async (req, res) => {
 });
 var wss = new import_websocket_server.default({ server: httpServer });
 wss.on("connection", (ws) => {
-  if (pluginSocket && pluginSocket.readyState === import_websocket.default.OPEN) {
-    console.log("[bridge] New plugin connected, replacing previous connection");
-  }
-  pluginSocket = ws;
-  pluginContext = null;
-  console.log("[bridge] Figma plugin connected");
+  const conn = {
+    id: `c${nextConnectionId++}-${BRIDGE_RUN}`,
+    ws,
+    context: null,
+    file: null,
+    instance: null,
+    identifying: false
+  };
+  connections.set(conn.id, conn);
+  console.log(`[bridge] Figma plugin connected (${conn.id})`);
   ws.on("message", (data) => {
     let msg;
     try {
@@ -3779,8 +3880,8 @@ wss.on("connection", (ws) => {
     }
     if (msg.type === "ping") return;
     if (msg.type === "hello" && msg.context) {
-      pluginContext = msg.context;
-      console.log(`[bridge] Plugin context: ${msg.context.editorType}`);
+      conn.context = msg.context;
+      if (conn.file === null && !conn.identifying) void identify(conn);
       return;
     }
     if (!msg.id) {
@@ -3804,19 +3905,17 @@ wss.on("connection", (ws) => {
     }
   });
   ws.on("close", () => {
-    console.log("[bridge] Figma plugin disconnected");
-    if (pluginSocket === ws) {
-      pluginSocket = null;
-      pluginContext = null;
-    }
+    console.log(`[bridge] Figma plugin disconnected: ${label(conn)}`);
+    if (connections.get(conn.id) === conn) connections.delete(conn.id);
     for (const [id, p] of pending) {
+      if (p.connectionId !== conn.id) continue;
       clearTimeout(p.timer);
-      p.reject(new Error("Figma plugin disconnected"));
+      p.reject(new Error(`Figma file ${label(conn)} disconnected`));
       pending.delete(id);
     }
   });
   ws.on("error", (err) => {
-    console.error("[bridge] Plugin WebSocket error:", err.message);
+    console.error(`[bridge] Plugin WebSocket error (${conn.id}):`, err.message);
   });
 });
 httpServer.listen(PORT, "127.0.0.1", () => {
@@ -3827,10 +3926,12 @@ httpServer.on("error", (err) => {
   console.error("[bridge] Server error:", err.message);
   process.exit(1);
 });
-process.on("SIGTERM", () => {
+function shutdown() {
   console.log("[bridge] Shutting down...");
+  for (const ws of wss.clients) ws.terminate();
+  httpServer.closeAllConnections();
   httpServer.close(() => process.exit(0));
-});
-process.on("SIGINT", () => {
-  httpServer.close(() => process.exit(0));
-});
+  setTimeout(() => process.exit(0), 1e3).unref();
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
