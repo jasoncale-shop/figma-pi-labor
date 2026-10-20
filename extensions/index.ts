@@ -298,6 +298,10 @@ async function waitForPlugin(
 
 // ## TOOL HELPERS
 
+function formatToolOutput(output: unknown): string {
+  return JSON.stringify(output, null, 2) ?? "No result returned by Figma.";
+}
+
 interface BridgeToolOptions {
   timeout?: number;
   signal?: AbortSignal;
@@ -376,9 +380,7 @@ async function runBridgeTool(
         }
       : result;
     return {
-      content: [
-        { type: "text" as const, text: JSON.stringify(output, null, 2) },
-      ],
+      content: [{ type: "text" as const, text: formatToolOutput(output) }],
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -3847,7 +3847,7 @@ var httpServer = import_node_http.default.createServer(async (req, res) => {
         timeout
       );
       sendJson(res, 200, {
-        result: req.url === "/undo" ? "undo applied" : result,
+        result: (req.url === "/undo" ? "undo applied" : result) ?? null,
         file: describe(conn)
       });
     } catch (err) {
