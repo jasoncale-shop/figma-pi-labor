@@ -43,12 +43,14 @@ FIGMA_MCP_PORT=3845 pi
 
 ### Commands
 
-| Command              | Description                                           |
-| -------------------- | ----------------------------------------------------- |
-| `/figma-labor-start` | Start bridge server manually                          |
-| `/figma-labor-stop`  | Stop bridge server manually                           |
-| `/figma-labor`       | Show bridge status and connected Figma files          |
-| `/figma-mcp`         | Show Figma MCP server status and list available tools |
+| Command                     | Description                                                      |
+| --------------------------- | ---------------------------------------------------------------- |
+| `/figma-labor-start`        | Start bridge server manually                                     |
+| `/figma-labor-stop`         | Stop bridge server manually                                      |
+| `/figma-labor`              | Show bridge status and connected Figma files                     |
+| `/figma-labor-watch [file]` | Hand new "Agent" annotations in this session's file to the agent |
+| `/figma-labor-watch off`    | Stop watching annotations                                        |
+| `/figma-mcp`                | Show Figma MCP server status and list available tools            |
 
 ### Footer status
 
@@ -58,6 +60,7 @@ labor ◌ ◌     bridge running, but plugin and MCP are not working
 labor ◌ M     MCP working (Figma is open and MCP is enabled)
 labor P M     plugin is running and MCP is working
 labor P2 M    plugin is open in 2 files
+watching "x"  /figma-labor-watch is on for file "x"
 ```
 
 ### Multiple files
@@ -69,6 +72,19 @@ Open _Pi Labor_ in several files and run one agent per file. The bridge keeps a 
 - With several files connected and none picked, Labor tools refuse instead of guessing
 - Agents in the same file share its undo history, selection, and viewport
 - The desktop Figma MCP may describe the file in the active tab rather than the agent's target
+
+### Annotations
+
+The Plugin API can't read comments, but it can read and write annotations, so annotations are how a designer asks the agent for changes from inside Figma:
+
+1. Annotate a layer and put the annotation in the **Agent** category, e.g. "make this red"
+2. Ask pi to work through the annotations, or run `/figma-labor-watch` to have new ones sent to the agent as they appear
+3. The agent makes each change, then replies on the annotation with a paragraph such as `🤖 Done: filled Frame 1 with red` or `🤖 Question: which red?`
+4. Delete the annotation when you're happy. To follow up, add a paragraph under the reply; that makes the request pending again
+
+A request counts as pending until its last paragraph is a 🤖 reply. Other categories (Development, Content, …) stay specs: the agent reads them for context but doesn't act on them.
+
+`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, sends pending requests right away, then sends each new or edited one within a few seconds. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`. Switching the session to another file with `labor_use_file` stops it.
 
 ## MCP ↔ Labor
 
@@ -109,6 +125,8 @@ MCP tools are preferred for reading. If MCP is unavailable, Labor will use Figma
 | `labor_zoom_to_node`              | Zoom the viewport to a node without selecting it               |
 | `labor_detach_instance`           | Detach a component instance into a plain frame                 |
 | `labor_run_script`                | Run arbitrary JavaScript in the Figma plugin context           |
+| `labor_get_annotations`           | List annotations on the page, selection, a node, or document   |
+| `labor_update_annotations`        | Add, update, remove, or reply to one annotation                |
 | `labor_undo`                      | Undo the last operation                                        |
 | `labor_list_files`                | List connected Figma files and this agent's target             |
 | `labor_use_file`                  | Point this agent's Labor tools at one connected file           |

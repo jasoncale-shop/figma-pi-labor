@@ -32,6 +32,8 @@
  *   labor_zoom_to_node        Zoom the viewport to a node without selecting it
  *   labor_detach_instance     Detach an instance, converting it to a plain frame
  *   labor_run_script          Run arbitrary JS in the Figma plugin context
+ *   labor_get_annotations     List annotations on the page, selection, a node, or the document
+ *   labor_update_annotations  Add, update, remove, or reply to one annotation
  *   labor_undo                Undo the last operation
  *   labor_list_files          List connected Figma files and this agent's target
  *   labor_use_file            Point this agent's tools at one connected file
@@ -120,11 +122,14 @@ function isStaleSessionContextError(error: unknown): boolean {
   );
 }
 
-function updateFooterStatus(ctx: {
+/** The part of a pi context that sets footer status entries. */
+interface StatusContext {
   ui: {
     setStatus: (key: string, value: string | undefined) => void;
   };
-}): boolean {
+}
+
+function updateFooterStatus(ctx: StatusContext): boolean {
   try {
     if (cachedStatus?.bridge !== "running") {
       ctx.ui.setStatus("labor", undefined);
@@ -389,6 +394,329 @@ async function runBridgeTool(
       isError: true,
     };
   }
+}
+
+// ## ANNOTATIONS
+
+// The plugin has no annotation commands, so the annotation tools and the
+// watch send fixed scripts through run_script. Arguments travel as JSON.
+
+/** Annotations in this category are requests for the agent. */
+const AGENT_CATEGORY = "Agent";
+/** Starts the agent's reply paragraph inside an annotation. */
+const AGENT_REPLY_MARK = "🤖";
+
+const ANNOTATION_PROPERTY_TYPES = [
+  "width",
+  "height",
+  "maxWidth",
+  "minWidth",
+  "maxHeight",
+  "minHeight",
+  "fills",
+  "strokes",
+  "effects",
+  "strokeWeight",
+  "cornerRadius",
+  "textStyleId",
+  "textAlignHorizontal",
+  "fontFamily",
+  "fontStyle",
+  "fontSize",
+  "fontWeight",
+  "lineHeight",
+  "letterSpacing",
+  "itemSpacing",
+  "padding",
+  "layoutMode",
+  "alignItems",
+  "opacity",
+  "mainComponent",
+  "gridRowGap",
+  "gridColumnGap",
+  "gridRowCount",
+  "gridColumnCount",
+  "gridRowAnchorIndex",
+  "gridColumnAnchorIndex",
+  "gridRowSpan",
+  "gridColumnSpan",
+] as const;
+
+// Shared by every annotation script; `args` is defined by annotationScript.
+// Node lookups catch: getNodeByIdAsync throws after ~10 s for unknown ids.
+const ANNOTATION_SCRIPT_HELPERS = `
+if (!figma.annotations) return { error: "Annotations are only available in Figma Design and Dev Mode." };
+const AGENT = ${JSON.stringify(AGENT_CATEGORY)};
+const REPLY_MARK = ${JSON.stringify(AGENT_REPLY_MARK)};
+const categories = (await figma.annotations.getAnnotationCategoriesAsync()).map((c) => ({ id: c.id, label: c.label }));
+const categoryLabel = (id) => categories.find((c) => c.id === id)?.label;
+const isAgentCategory = (id) => categoryLabel(id)?.trim().toLowerCase() === AGENT.toLowerCase();
+const findCategory = (key) => categories.find((c) => c.id === key || c.label.trim().toLowerCase() === key.trim().toLowerCase());
+async function ensureAgentCategory() {
+  const found = findCategory(AGENT);
+  if (found) return { category: found, created: false };
+  const added = await figma.annotations.addAnnotationCategoryAsync({ label: AGENT, color: "violet" });
+  const category = { id: added.id, label: added.label };
+  categories.push(category);
+  return { category, created: true };
+}
+const labelOf = (a) => a.labelMarkdown || a.label || "";
+// A request is pending until its last paragraph is the agent's reply.
+function isPending(a) {
+  const paragraphs = labelOf(a).split(/\\n+/).map((p) => p.trim()).filter(Boolean);
+  return paragraphs.length > 0 && !paragraphs[paragraphs.length - 1].startsWith(REPLY_MARK);
+}
+function describeAnnotation(a, index) {
+  const out = { index };
+  const label = labelOf(a);
+  if (label) out.label = label;
+  if (a.categoryId) {
+    const name = categoryLabel(a.categoryId);
+    if (name) out.category = name;
+    else out.categoryId = a.categoryId;
+    if (isAgentCategory(a.categoryId)) out.status = isPending(a) ? "pending" : "replied";
+  }
+  if (a.properties?.length) out.properties = a.properties.map((p) => p.type);
+  return out;
+}
+function pageOf(node) {
+  let p = node;
+  while (p && p.type !== "PAGE") p = p.parent;
+  return p;
+}
+function pathOf(node) {
+  const names = [];
+  for (let p = node.parent; p && p.type !== "PAGE"; p = p.parent) names.push(p.name);
+  if (names.length <= 2) return names.reverse().join(" › ");
+  return names[names.length - 1] + " › … › " + names[0];
+}
+async function nodeById(id) {
+  try {
+    return await figma.getNodeByIdAsync(id);
+  } catch {
+    return null;
+  }
+}
+const hasAnnotations = (n) => "annotations" in n && n.annotations.length > 0;
+`;
+
+function annotationScript(body: string, args: Record<string, unknown>): string {
+  return `const args = ${JSON.stringify(args)};\n${ANNOTATION_SCRIPT_HELPERS}\n${body}`;
+}
+
+const GET_ANNOTATIONS_SCRIPT = `
+const wanted = args.category?.trim().toLowerCase();
+const matches = (a) => !wanted || a.categoryId === args.category || categoryLabel(a.categoryId)?.trim().toLowerCase() === wanted;
+let scope;
+let nodes = [];
+const collect = (root) => {
+  if (hasAnnotations(root)) nodes.push(root);
+  if ("findAll" in root) nodes.push(...root.findAll(hasAnnotations));
+};
+if (args.nodeId) {
+  const root = await nodeById(args.nodeId);
+  if (!root) return { error: "Node " + args.nodeId + " not found." };
+  scope = "node " + root.id;
+  collect(root);
+} else if (args.scope === "selection") {
+  const selection = figma.currentPage.selection;
+  if (!selection.length) return { error: "Nothing is selected." };
+  scope = "selection";
+  selection.forEach(collect);
+} else if (args.scope === "document") {
+  await figma.loadAllPagesAsync();
+  scope = "document";
+  nodes = figma.root.findAll(hasAnnotations);
+} else {
+  scope = 'page "' + figma.currentPage.name + '"';
+  nodes = figma.currentPage.findAll(hasAnnotations);
+}
+const seen = new Set();
+const shown = [];
+let nodeCount = 0;
+let annotationCount = 0;
+for (const node of nodes) {
+  if (seen.has(node.id)) continue;
+  seen.add(node.id);
+  const annotations = node.annotations.flatMap((a, i) => (matches(a) ? [describeAnnotation(a, i)] : []));
+  if (!annotations.length) continue;
+  nodeCount++;
+  annotationCount += annotations.length;
+  if (shown.length >= args.limit) continue;
+  const entry = { nodeId: node.id, name: node.name, type: node.type };
+  const path = pathOf(node);
+  if (path) entry.path = path;
+  if (scope === "document") entry.page = pageOf(node)?.name;
+  entry.annotations = annotations;
+  shown.push(entry);
+}
+const result = { scope, categories, nodeCount, annotationCount, nodes: shown };
+if (nodeCount > shown.length) result.truncated = "Showing " + shown.length + " of " + nodeCount + " nodes; narrow with nodeId or category, or raise limit.";
+return result;
+`;
+
+const UPDATE_ANNOTATIONS_SCRIPT = `
+const node = await nodeById(args.nodeId);
+if (!node) return { error: "Node " + args.nodeId + " not found." };
+if (!("annotations" in node)) return { error: node.type + " nodes can't have annotations." };
+// Figma rejects annotations that set both label and labelMarkdown, which is
+// how it reports them, so copy one of the two.
+const list = node.annotations.map((a) => {
+  const copy = {};
+  if (a.labelMarkdown) copy.labelMarkdown = a.labelMarkdown;
+  else if (a.label) copy.label = a.label;
+  if (a.properties?.length) copy.properties = a.properties.map((p) => ({ type: p.type }));
+  if (a.categoryId) copy.categoryId = a.categoryId;
+  return copy;
+});
+const index = args.index;
+if (args.action !== "add" && (index === undefined || !list[index])) {
+  return { error: "Annotation index " + index + " is out of range; the node has " + list.length + " annotation(s)." };
+}
+let categoryId;
+let createdCategory = false;
+if (args.category) {
+  let category = findCategory(args.category);
+  if (!category && args.category.trim().toLowerCase() === AGENT.toLowerCase()) {
+    const ensured = await ensureAgentCategory();
+    category = ensured.category;
+    createdCategory = ensured.created;
+  }
+  if (!category) return { error: 'No annotation category "' + args.category + '". Categories: ' + categories.map((c) => c.label).join(", ") + "." };
+  categoryId = category.id;
+}
+const properties = args.properties?.map((type) => ({ type }));
+if (args.action === "add") {
+  const added = {};
+  if (args.label) added.labelMarkdown = args.label;
+  if (properties?.length) added.properties = properties;
+  if (categoryId) added.categoryId = categoryId;
+  if (!added.labelMarkdown && !added.properties) return { error: "add needs a label or properties." };
+  list.push(added);
+} else if (args.action === "update") {
+  const a = list[index];
+  if (args.label !== undefined) {
+    delete a.label;
+    delete a.labelMarkdown;
+    if (args.label) a.labelMarkdown = args.label;
+  }
+  if (args.category !== undefined) {
+    delete a.categoryId;
+    if (categoryId) a.categoryId = categoryId;
+  }
+  if (properties !== undefined) {
+    delete a.properties;
+    if (properties.length) a.properties = properties;
+  }
+  if (!a.labelMarkdown && !a.label && !a.properties) return { error: "That would leave the annotation empty; use remove." };
+} else if (args.action === "reply") {
+  const text = args.label?.trim().replace(/\\s*\\n+\\s*/g, " ");
+  if (!text) return { error: "reply needs a label: the reply text." };
+  const a = list[index];
+  const previous = a.labelMarkdown ?? a.label ?? "";
+  delete a.label;
+  a.labelMarkdown = (previous ? previous + "\\n\\n" : "") + REPLY_MARK + " " + text;
+} else {
+  list.splice(index, 1);
+}
+node.annotations = list;
+const result = { nodeId: node.id, name: node.name, annotations: node.annotations.map(describeAnnotation) };
+if (createdCategory) result.createdCategory = AGENT;
+return result;
+`;
+
+// One listener per plugin instance records nodes whose annotations change,
+// keeping at most 1000; each poll reads the ones changed since its last poll.
+// A watcher's first poll, and any poll after the plugin restarted, scans the
+// whole document instead.
+const WATCH_ANNOTATIONS_SCRIPT = `
+const createdCategory = args.ensureCategory ? (await ensureAgentCategory()).created : false;
+let state = globalThis.__laborAnnotationWatch;
+let full = args.since === null;
+if (!state) {
+  await figma.loadAllPagesAsync();
+  const changed = new Map();
+  figma.on("documentchange", (event) => {
+    const at = Date.now();
+    for (const change of event.documentChanges) {
+      if (change.type === "DELETE") {
+        changed.delete(change.id);
+        continue;
+      }
+      const annotated =
+        change.type === "PROPERTY_CHANGE"
+          ? change.properties.includes("annotations")
+          : change.type === "CREATE" && hasAnnotations(change.node);
+      if (!annotated) continue;
+      changed.delete(change.id);
+      changed.set(change.id, { node: change.node, at });
+      if (changed.size > 1000) changed.delete(changed.keys().next().value);
+    }
+  });
+  state = globalThis.__laborAnnotationWatch = { changed };
+  full = true;
+}
+const now = Date.now();
+for (const [id, entry] of state.changed) if (now - entry.at > 600000) state.changed.delete(id);
+const nodes = full
+  ? figma.root.findAll(hasAnnotations)
+  : [...state.changed.values()].filter((entry) => entry.at >= args.since && !entry.node.removed).map((entry) => entry.node);
+const requests = [];
+for (const node of nodes) {
+  if (!("annotations" in node)) continue;
+  node.annotations.forEach((a, index) => {
+    if (isAgentCategory(a.categoryId) && isPending(a)) {
+      requests.push({ nodeId: node.id, name: node.name, index, label: labelOf(a), page: pageOf(node)?.name });
+    }
+  });
+}
+return { since: now, requests, createdCategory };
+`;
+
+interface AnnotationRequest {
+  nodeId: string;
+  name: string;
+  index: number;
+  label: string;
+  page?: string;
+}
+
+function watchMessage(file: string, requests: AnnotationRequest[]): string {
+  const lines = requests.map(
+    (r) =>
+      `- node ${r.nodeId} "${r.name}"${r.page ? ` on page "${r.page}"` : ""}, annotation ${r.index}:\n  ${r.label.replace(/\n+/g, "\n  ")}`,
+  );
+  const count =
+    requests.length === 1 ? "1 new request" : `${requests.length} new requests`;
+  return [
+    `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}".`,
+    ...lines,
+    `Handle each on its node and verify, then reply on that annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need.`,
+  ].join("\n");
+}
+
+/** Match a connected file by connection id or unique file name. */
+function resolveFile(
+  files: BridgeFile[],
+  query: string,
+): { file: BridgeFile; target: string } | { error: string } {
+  const sameName = files.filter((file) => file.file === query);
+  const match =
+    files.find((file) => file.id === query) ??
+    (sameName.length === 1 ? sameName[0] : undefined);
+  if (!match) {
+    const reason =
+      sameName.length > 1
+        ? `Several connected files are named "${query}"; use a connection id.`
+        : `No connected Figma file matches "${query}".`;
+    const connected = files.length ? files.map(fileLabel).join(", ") : "none";
+    return { error: `${reason} Connected: ${connected}.` };
+  }
+  // Prefer the name: it survives plugin reconnects, which change the id.
+  const nameIsUnique =
+    match.file !== null &&
+    files.filter((file) => file.file === match.file).length === 1;
+  return { file: match, target: nameIsUnique ? match.file! : match.id };
 }
 
 // ## MCP HELPERS
@@ -877,6 +1205,74 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  // Annotation watch: off until /figma-labor-watch turns it on for one file,
+  // this session's target. Polls that file and sends new Agent requests to the
+  // agent as follow-up messages.
+  interface AnnotationWatch {
+    file: string;
+    ctx: StatusContext;
+    since: number | null;
+    /** nodeId + label of every request already sent to the agent. */
+    sent: Set<string>;
+    timer?: ReturnType<typeof setInterval>;
+    polling: boolean;
+  }
+  let annotationWatch: AnnotationWatch | null = null;
+
+  async function pollAnnotationWatch(
+    watch: AnnotationWatch,
+    ensureCategory: boolean,
+  ): Promise<{ sent: number; createdCategory: boolean }> {
+    const { result } = await bridgeCommand(
+      "run_script",
+      {
+        code: annotationScript(WATCH_ANNOTATIONS_SCRIPT, {
+          since: watch.since,
+          ensureCategory,
+        }),
+      },
+      { target: watch.file, timeout: 60_000 },
+    );
+    if (!result || typeof result !== "object" || "error" in result) {
+      throw new Error(
+        (result as { error?: string } | null)?.error ??
+          "The annotation scan returned nothing.",
+      );
+    }
+    const { since, requests, createdCategory } = result as {
+      since: number;
+      requests: AnnotationRequest[];
+      createdCategory: boolean;
+    };
+    watch.since = since;
+    const fresh = requests.filter((request) => {
+      const key = `${request.nodeId}\n${request.label}`;
+      if (watch.sent.has(key)) return false;
+      watch.sent.add(key);
+      return true;
+    });
+    if (fresh.length && annotationWatch === watch) {
+      pi.sendUserMessage(watchMessage(watch.file, fresh), {
+        deliverAs: "followUp",
+      });
+    }
+    return { sent: fresh.length, createdCategory };
+  }
+
+  /** Stop the watch, if any, and return the file it watched. */
+  function stopAnnotationWatch(): string | null {
+    const watch = annotationWatch;
+    if (!watch) return null;
+    annotationWatch = null;
+    clearInterval(watch.timer);
+    try {
+      watch.ctx.ui.setStatus("labor-watch", undefined);
+    } catch (error) {
+      if (!isStaleSessionContextError(error)) throw error;
+    }
+    return watch.file;
+  }
+
   function isCurrentBridgeSession(run: number, signal: AbortSignal): boolean {
     return run === bridgeSessionRun && !signal.aborted;
   }
@@ -917,6 +1313,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    stopAnnotationWatch();
     targetFile = null;
     bridgeStartupAbort?.abort();
     const run = ++bridgeSessionRun;
@@ -939,6 +1336,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    stopAnnotationWatch();
     bridgeStartupAbort?.abort();
     bridgeStartupAbort = null;
     bridgeSessionRun++;
@@ -1065,6 +1463,107 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("figma-labor-watch", {
+    description: `Watch this session's Figma file for "${AGENT_CATEGORY}" annotations and send new ones to the agent. /figma-labor-watch <file> picks the file; /figma-labor-watch off stops`,
+    handler: async (args, ctx) => {
+      const arg = args.trim();
+      if (arg === "off") {
+        const file = stopAnnotationWatch();
+        ctx.ui.notify(
+          file
+            ? `Stopped watching annotations in "${file}".`
+            : "Not watching annotations.",
+          "info",
+        );
+        return;
+      }
+      if (annotationWatch && !arg) {
+        ctx.ui.notify(
+          `Watching "${annotationWatch.file}" for "${AGENT_CATEGORY}" annotations. /figma-labor-watch off stops.`,
+          "info",
+        );
+        return;
+      }
+      const files = (await bridgeStatus())?.files ?? [];
+      if (!files.length) {
+        ctx.ui.notify("No Figma file has the Labor plugin open.", "error");
+        return;
+      }
+      const query =
+        arg || targetFile || (files.length === 1 ? files[0].id : null);
+      if (!query) {
+        ctx.ui.notify(
+          `Several files are connected; name one: /figma-labor-watch <file>. Connected: ${files.map(fileLabel).join(", ")}.`,
+          "error",
+        );
+        return;
+      }
+      const resolved = resolveFile(files, query);
+      if ("error" in resolved) {
+        ctx.ui.notify(resolved.error, "error");
+        return;
+      }
+      const editor = resolved.file.editorType;
+      if (editor !== "figma" && editor !== "dev") {
+        ctx.ui.notify(
+          `Annotations exist only in Figma Design and Dev Mode; ${fileLabel(resolved.file)} is open in ${editor ?? "an unknown editor"}.`,
+          "error",
+        );
+        return;
+      }
+
+      stopAnnotationWatch();
+      targetFile = resolved.target;
+      const watch: AnnotationWatch = {
+        file: resolved.target,
+        ctx,
+        since: null,
+        sent: new Set(),
+        polling: true,
+      };
+      annotationWatch = watch;
+      let first: { sent: number; createdCategory: boolean };
+      try {
+        first = await pollAnnotationWatch(watch, true);
+      } catch (err) {
+        if (annotationWatch === watch) annotationWatch = null;
+        const msg = err instanceof Error ? err.message : String(err);
+        ctx.ui.notify(
+          `Couldn't read annotations in "${watch.file}": ${msg}`,
+          "error",
+        );
+        return;
+      } finally {
+        watch.polling = false;
+      }
+      // Stopped, or replaced by another watch, during the first scan.
+      if (annotationWatch !== watch) return;
+
+      watch.timer = setInterval(async () => {
+        if (watch.polling) return;
+        watch.polling = true;
+        try {
+          await pollAnnotationWatch(watch, false);
+        } catch {
+          // The plugin or bridge is away; the next tick retries.
+        } finally {
+          watch.polling = false;
+        }
+      }, 3000);
+      ctx.ui.setStatus("labor-watch", `watching "${watch.file}"`);
+      const created = first.createdCategory
+        ? ` Added the "${AGENT_CATEGORY}" annotation category to the file.`
+        : "";
+      const sent = first.sent
+        ? ` Sent ${first.sent} pending request${first.sent === 1 ? "" : "s"} to the agent.`
+        : " No pending requests yet.";
+      ctx.ui.notify(
+        `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created}${sent}`,
+        "success",
+      );
+    },
+  });
+
   // Tools
 
   // ## Files
@@ -1123,35 +1622,28 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       const files = (await bridgeStatus())?.files ?? [];
-      const sameName = files.filter((file) => file.file === params.file);
-      const match =
-        files.find((file) => file.id === params.file) ??
-        (sameName.length === 1 ? sameName[0] : undefined);
-      if (!match) {
-        const reason =
-          sameName.length > 1
-            ? `Several connected files are named "${params.file}"; use a connection id.`
-            : `No connected Figma file matches "${params.file}".`;
-        const connected = files.length
-          ? files.map(fileLabel).join(", ")
-          : "none";
+      const resolved = resolveFile(files, params.file);
+      if ("error" in resolved) {
         return {
-          content: [
-            { type: "text" as const, text: `${reason} Connected: ${connected}.` },
-          ],
+          content: [{ type: "text" as const, text: resolved.error }],
           isError: true,
         };
       }
-      // Prefer the name: it survives plugin reconnects, which change the id.
-      const nameIsUnique =
-        match.file !== null &&
-        files.filter((file) => file.file === match.file).length === 1;
-      targetFile = nameIsUnique ? match.file : match.id;
+      const { file: match, target } = resolved;
+      targetFile = target;
+      // The watch follows this session's file; it never runs against another.
+      const stoppedWatch =
+        annotationWatch && annotationWatch.file !== target
+          ? stopAnnotationWatch()
+          : null;
+      const watchNote = stoppedWatch
+        ? ` Stopped the annotation watch on "${stoppedWatch}"; tell the user, who can restart it with /figma-labor-watch.`
+        : "";
       return {
         content: [
           {
             type: "text" as const,
-            text: `Labor tools now target ${fileLabel(match)}: ${match.editorType ?? "unknown"} editor, page "${match.page?.name ?? "?"}".`,
+            text: `Labor tools now target ${fileLabel(match)}: ${match.editorType ?? "unknown"} editor, page "${match.page?.name ?? "?"}".${watchNote}`,
           },
         ],
       };
@@ -1254,6 +1746,82 @@ export default function (pi: ExtensionAPI) {
         { code: params.code },
         { timeout: 60_000, signal },
       );
+    },
+  });
+
+  // ## Annotations
+
+  pi.registerTool({
+    name: "labor_get_annotations",
+    label: "Get Annotations",
+    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes.`,
+    parameters: Type.Object({
+      nodeId: Type.Optional(
+        Type.String({ description: "Search this node and its descendants" }),
+      ),
+      scope: Type.Optional(
+        StringEnum(["page", "selection", "document"] as const, {
+          description:
+            "Where to search when nodeId is omitted. Default: page (the current page)",
+        }),
+      ),
+      category: Type.Optional(
+        Type.String({
+          description: `Only annotations in this category, by label or id, e.g. "${AGENT_CATEGORY}"`,
+        }),
+      ),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 200,
+          description: "Most nodes to return. Default 50",
+        }),
+      ),
+    }),
+    async execute(_id, params, signal) {
+      const code = annotationScript(GET_ANNOTATIONS_SCRIPT, {
+        ...params,
+        limit: params.limit ?? 50,
+      });
+      return runTool("run_script", { code }, { timeout: 60_000, signal });
+    },
+  });
+
+  pi.registerTool({
+    name: "labor_update_annotations",
+    label: "Update Annotations",
+    description: `Add, update, remove, or reply to one annotation on a node, leaving its other annotations as they are. "reply" appends a ${AGENT_REPLY_MARK} paragraph to an existing annotation: use it to answer "${AGENT_CATEGORY}" requests. Use this tool instead of assigning node.annotations in a script, which replaces every annotation on the node.`,
+    parameters: Type.Object({
+      nodeId: Type.String({ description: "Node ID" }),
+      action: StringEnum(["add", "update", "remove", "reply"] as const),
+      index: Type.Optional(
+        Type.Integer({
+          minimum: 0,
+          description:
+            "Annotation index from labor_get_annotations. Required except for add",
+        }),
+      ),
+      label: Type.Optional(
+        Type.String({
+          description:
+            "Markdown text. reply: the one-line reply. update: replaces the text; an empty string removes it",
+        }),
+      ),
+      category: Type.Optional(
+        Type.String({
+          description: `Category label or id. update: an empty string removes it. "${AGENT_CATEGORY}" is added to the file if it's missing`,
+        }),
+      ),
+      properties: Type.Optional(
+        Type.Array(StringEnum(ANNOTATION_PROPERTY_TYPES), {
+          description:
+            "Properties to pin, e.g. width or fills. update: replaces them; an empty array removes them",
+        }),
+      ),
+    }),
+    async execute(_id, params, signal) {
+      const code = annotationScript(UPDATE_ANNOTATIONS_SCRIPT, params);
+      return runTool("run_script", { code }, { timeout: 60_000, signal });
     },
   });
 
