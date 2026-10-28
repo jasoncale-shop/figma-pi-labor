@@ -151,3 +151,5 @@ This rebundles `bridge.js` into the `extensions/` directory.
 A bridge that is already running keeps the old code after you rebuild `bridge.js`. Run `/figma-labor-stop`, then any Labor tool call or `/figma-labor-start`; the plugin reconnects within a few seconds. A bridge from before `/figma-labor-stop` existed can't be stopped that way: kill its `node …/bridge.js` process once.
 
 To run a throwaway bridge next to the live one (the plugin only talks to 3846), set `LABOR_BRIDGE_PORT` for both pi and the bridge, e.g. `LABOR_BRIDGE_PORT=3999 pi`.
+
+To test that the bridge outlives the sessions using it, run `bun test` from the repo root. It runs the real extension and `bridge.js` against a fake pi and a fake plugin on a free port, so the live bridge on 3846 is never touched.
