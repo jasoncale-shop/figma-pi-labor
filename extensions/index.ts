@@ -1207,10 +1207,11 @@ export default function (pi: ExtensionAPI) {
 
   // Annotation watch: off until /figma-labor-watch turns it on for one file,
   // this session's target. Polls that file and sends new Agent requests to the
-  // agent as follow-up messages.
+  // agent: as a new turn when it's idle, queued behind the running turn when
+  // it's busy.
   interface AnnotationWatch {
     file: string;
-    ctx: StatusContext;
+    ctx: StatusContext & { isIdle(): boolean };
     since: number | null;
     /** nodeId + label of every request already sent to the agent. */
     sent: Set<string>;
@@ -1252,9 +1253,12 @@ export default function (pi: ExtensionAPI) {
       return true;
     });
     if (fresh.length && annotationWatch === watch) {
-      pi.sendUserMessage(watchMessage(watch.file, fresh), {
-        deliverAs: "followUp",
-      });
+      // "followUp" queues even when the agent is idle, so an idle session
+      // never starts a turn; use it only while a turn is running.
+      pi.sendUserMessage(
+        watchMessage(watch.file, fresh),
+        watch.ctx.isIdle() ? undefined : { deliverAs: "followUp" },
+      );
     }
     return { sent: fresh.length, createdCategory };
   }

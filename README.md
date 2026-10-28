@@ -84,7 +84,7 @@ The Plugin API can't read comments, but it can read and write annotations, so an
 
 A request counts as pending until its last paragraph is a 🤖 reply. Other categories (Development, Content, …) stay specs: the agent reads them for context but doesn't act on them.
 
-`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, sends pending requests right away, then sends each new or edited one within a few seconds. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`. Switching the session to another file with `labor_use_file` stops it.
+`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, sends pending requests right away, then sends each new or edited one within a few seconds. An idle agent starts on them at once; a busy one gets them after its current turn. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`. Switching the session to another file with `labor_use_file` stops it.
 
 ## MCP ↔ Labor
 
