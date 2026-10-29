@@ -60,14 +60,20 @@ labor ◌ ◌     bridge running, but plugin and MCP are not working
 labor ◌ M     MCP working (Figma is open and MCP is enabled)
 labor P M     plugin is running and MCP is working
 labor P2 M    plugin is open in 2 files
-watching "x"  /figma-labor-watch is on for file "x"
-watching "x" · agent 1/2 replied · <step>
-              its background agent replied on 1 of 2 requests so far; <step> is what it's doing now
-watching "x" · … · 1 queued
-              a request is waiting for the next run
-watching "x" · last run failed
+○ watch "x" · idle
+              /figma-labor-watch is on for file "x"
+⠹ watch "x" · 1/2 replied · Exporting Frame 3 12s · 1 queued
+              its background agent replied on 1 of 2 requests so far, and has spent 12s on its
+              current step (or thinking); 1 request waits for the next run
+⠹ watch "x" · 2/2 replied · retry 1/3 in 8s: 529 Overloaded
+              the model provider failed and the agent is waiting to retry
+○ watch "x" · last run 4m ago, 2/2 replied
+              the last run ended and replied on both its requests
+✗ watch "x" · last run failed 4m ago
               the last run ended in an error; its notification says why
 ```
+
+Expand tool output (ctrl+o) to see the watch's details under the editor: each request with the agent's reply, its latest steps with their times and errors, what it last wrote or thought, its cost, and the log path. While it's idle the details show the last run. `/figma-labor-watch` with no argument posts the same details as a notification.
 
 ### Multiple files
 
@@ -94,7 +100,7 @@ Annotate frames, components, instances, shapes, or text, not groups: Figma gives
 
 Copies keep their source's annotations, but not its requests: `labor_clone_node` drops the **Agent** annotations a clone copied, and while the watch runs, so does duplicating, pasting, or cloning by any means, as long as the original is still in the file. A cut-and-paste keeps its request, and other categories are always kept.
 
-`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p --mode json` or `pi -p --mode json`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: during a run the footer follows its events, showing how many requests it has replied on and its current step, and a notification reports each run's end with the reply count, or the API error that stopped it. One run goes at a time, and requests that arrive meanwhile wait for the next. Each run's steps, replies, and errors go to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
+`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p --mode json` or `pi -p --mode json`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: during a run the footer and its details follow its events, and a notification reports each run's end with each request's reply, or the API error that stopped it. One run goes at a time, and requests that arrive meanwhile wait for the next. A run ends when its agent does: omp's advisor reviews a finished run while the process waits, for up to 10 minutes, and nothing it says then reaches Figma, so the watch ends the process a few seconds after the agent's last message. Each run's steps, replies, and errors go to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
 
 ## MCP ↔ Labor
 

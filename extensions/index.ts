@@ -41,7 +41,11 @@
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, readFileSync, realpathSync } from "node:fs";
@@ -68,6 +72,15 @@ const MAX_OUTPUT_BYTES = 50 * 1024;
 const HOST_CLI = process.argv[1]?.includes("@oh-my-pi/") ? "omp" : "pi";
 /** Output of the annotation watch's background agent runs. */
 const WATCH_LOG = join(tmpdir(), "figma-labor-watch.log");
+/**
+ * How long the watch lets its agent's process exit on its own once the agent
+ * is done. omp's advisor reviews a finished run while its process waits, for
+ * up to 10 minutes; nothing it says then reaches Figma, so the watch ends the
+ * process instead of holding the next requests behind it.
+ */
+const AGENT_END_GRACE_MS = 3_000;
+/** How often the watch redraws its footer and details. */
+const WATCH_TICK_MS = 100;
 
 // ## MCP STATE
 
@@ -899,21 +912,110 @@ interface AgentStreamEvent {
     content?: { type: string; text?: string }[];
     stopReason?: string;
     errorMessage?: string;
+    usage?: { cost?: { total?: number } };
   };
+  /** message_update: a streamed piece of the agent's reply or thinking. */
+  assistantMessageEvent?: { type?: string; delta?: string };
+  /** agent_end, omp only: false when the agent carries on, e.g. with a queued follow-up. */
+  isTerminal?: boolean;
+  /** auto_retry_start and auto_retry_end. */
+  attempt?: number;
+  maxAttempts?: number;
+  delayMs?: number;
+  errorMessage?: string;
+  success?: boolean;
+  finalError?: string;
 }
 
-/** A background agent run, as the footer and the run-end notification report it. */
+/** One tool call of a background agent run. */
+interface AgentStep {
+  label: string;
+  startedAt: number;
+  endedAt?: number;
+  /** The error it returned. */
+  error?: string;
+}
+
+/** A request handed to a run, with the agent's reply once it lands. */
+interface RunRequest extends AnnotationRequest {
+  reply?: string;
+}
+
+/** What a background agent run is doing, as the footer names it. */
+type AgentPhase =
+  "starting" | "thinking" | "tool" | "retrying" | "compacting" | "finishing";
+
+/** A background agent run, as the footer, its details, and the run-end notification report it. */
 interface AgentRun {
   process: ChildProcess;
-  requests: number;
-  /** Requests it has replied on. */
-  replied: number;
-  /** What it's doing now: the running tool call's intent, or "thinking". */
-  activity: string;
-  /** Running tool calls, by call id. */
-  calls: Map<string, { label: string; reply: boolean }>;
+  requests: RunRequest[];
+  startedAt: number;
+  phase: AgentPhase;
+  phaseSince: number;
+  /** Running tool calls, by call id, with the request each replies on if it succeeds. */
+  calls: Map<
+    string,
+    { step: AgentStep; answers: { request: RunRequest; text: string } | null }
+  >;
+  /** Every tool call so far, oldest first. */
+  steps: AgentStep[];
+  /** What the agent last wrote or thought. */
+  said: string;
+  /** Whether `said` is still streaming in. */
+  saying: boolean;
+  /** Model spend so far, as the host prices it. */
+  cost: number;
+  /** While a failed model request waits for its retry. */
+  retry: {
+    attempt: number;
+    maxAttempts: number;
+    at: number;
+    error: string;
+  } | null;
   /** The last model API error; one ends the run unless a retry gets through. */
   apiError: string | null;
+  /** Stop reason of the agent's latest message. */
+  stopReason: string | null;
+  /** Set at the agent's final agent_end: its work is over, whatever its process does next. */
+  done: boolean;
+  endTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** A run that ended, kept for the idle footer and details. */
+interface FinishedRun {
+  run: AgentRun;
+  endedAt: number;
+  failure: string | null;
+}
+
+/** The annotation watch on one file; the extension's watch section runs it. */
+interface AnnotationWatch {
+  file: string;
+  ctx: ExtensionContext;
+  since: number | null;
+  /** nodeId + label of every request already handed to the agent. */
+  sent: Set<string>;
+  /** Groups whose annotation changes the watch has said it can't read. */
+  warned: Set<string>;
+  /** Requests waiting for the running agent to finish. */
+  queue: AnnotationRequest[];
+  /** The background agent's current run. */
+  run: AgentRun | null;
+  /** The run before it. */
+  last: FinishedRun | null;
+  timer?: ReturnType<typeof setInterval>;
+  polling: boolean;
+  /** Redraws the footer and details every WATCH_TICK_MS. */
+  ticker?: ReturnType<typeof setInterval>;
+  /** The footer text last set. */
+  status?: string;
+  /** The details widget while it's shown: its TUI, and the width and text it last drew. */
+  details: {
+    tui: { requestRender(): void } | null;
+    theme: WatchTheme;
+    width: number;
+    text: string;
+  } | null;
 }
 
 function clip(text: string, max: number): string {
@@ -967,67 +1069,355 @@ function apiErrorSummary(message: string): string {
   return clip(line, 200);
 }
 
+function collapse(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function repliedCount(run: AgentRun): number {
+  return run.requests.filter((r) => r.reply !== undefined).length;
+}
+
+/** The request of the run a labor_update_annotations call replies on. */
+function answeredRequest(
+  run: AgentRun,
+  args: Record<string, unknown>,
+): RunRequest | undefined {
+  if (args.action !== "reply") return undefined;
+  const open = run.requests.filter(
+    (r) => r.nodeId === args.nodeId && r.reply === undefined,
+  );
+  return open.find((r) => r.index === args.index) ?? open[0];
+}
+
 /**
  * Apply one line of the agent's JSON output to its run and log a readable
- * digest of it. Returns whether the footer needs an update.
+ * digest of it.
  */
 function followAgentLine(
   run: AgentRun,
   line: string,
   log: (text: string) => void,
-): boolean {
+): void {
   let event: AgentStreamEvent;
   try {
     event = JSON.parse(line) as AgentStreamEvent;
   } catch {
     log(line);
-    return false;
+    return;
   }
+  const now = Date.now();
+  const enter = (phase: AgentPhase) => {
+    run.phase = phase;
+    run.phaseSince = now;
+  };
   const id = event.toolCallId ?? "";
   switch (event.type) {
+    case "agent_start":
+    case "turn_start":
+      // After an agent_end, a continuation, such as pi's retry.
+      run.done = false;
+      if (!run.calls.size) enter("thinking");
+      return;
+    case "auto_retry_start": {
+      run.done = false;
+      const delay = event.delayMs ?? 0;
+      run.retry = {
+        attempt: event.attempt ?? 1,
+        maxAttempts: event.maxAttempts ?? 1,
+        at: now + delay,
+        error: apiErrorSummary(event.errorMessage ?? ""),
+      };
+      enter("retrying");
+      log(
+        `↻ retry ${run.retry.attempt}/${run.retry.maxAttempts} in ${formatDuration(delay)}: ${run.retry.error}`,
+      );
+      return;
+    }
+    case "auto_retry_end":
+      run.retry = null;
+      if (event.success === false && event.finalError) {
+        run.apiError = apiErrorSummary(event.finalError);
+      }
+      enter("thinking");
+      return;
+    case "auto_compaction_start": // omp
+    case "compaction_start": // pi
+      run.done = false;
+      enter("compacting");
+      log("… compacting context");
+      return;
+    case "auto_compaction_end":
+    case "compaction_end":
+      enter("thinking");
+      return;
+    case "message_start":
+      if (event.message?.role === "assistant") run.saying = false;
+      return;
+    case "message_update": {
+      const chunk = event.assistantMessageEvent;
+      if (
+        (chunk?.type === "text_delta" || chunk?.type === "thinking_delta") &&
+        chunk.delta
+      ) {
+        const said = run.saying ? run.said + chunk.delta : chunk.delta;
+        run.said = said.length > 2000 ? said.slice(-2000) : said;
+        run.saying = true;
+      }
+      return;
+    }
     case "tool_execution_start": {
       const tool = calledTool(event.toolName ?? "tool", event.args);
-      const label = clip(event.intent || tool.name, 60);
-      const reply =
-        tool.name === "labor_update_annotations" &&
-        tool.args.action === "reply";
-      run.calls.set(id, { label, reply });
-      run.activity = label;
-      log(`→ ${label}`);
-      return true;
+      const step: AgentStep = {
+        label: clip(event.intent || tool.name, 60),
+        startedAt: now,
+      };
+      const request =
+        tool.name === "labor_update_annotations"
+          ? answeredRequest(run, tool.args)
+          : undefined;
+      run.calls.set(id, {
+        step,
+        answers: request
+          ? { request, text: collapse(String(tool.args.label ?? "")) }
+          : null,
+      });
+      run.steps.push(step);
+      enter("tool");
+      log(`→ ${step.label}`);
+      return;
     }
     case "tool_execution_end": {
       const call = run.calls.get(id);
       run.calls.delete(id);
+      if (call) call.step.endedAt = now;
       if (event.isError) {
         const text =
           event.result?.content?.find((c) => c.type === "text")?.text ?? "";
-        log(`✗ ${call?.label ?? event.toolName}: ${clip(text, 300)}`);
-      } else if (call?.reply) {
-        run.replied++;
+        if (call) call.step.error = clip(collapse(text), 200);
+        log(`✗ ${call?.step.label ?? event.toolName}: ${clip(text, 300)}`);
+      } else if (call?.answers) {
+        call.answers.request.reply = call.answers.text;
       }
-      run.activity = [...run.calls.values()].at(-1)?.label ?? "thinking";
-      return true;
+      if (!run.calls.size) enter("thinking");
+      return;
     }
     case "message_end": {
       const { message } = event;
-      if (message?.role !== "assistant") return false;
+      if (message?.role !== "assistant") return;
+      run.saying = false;
+      run.cost += message.usage?.cost?.total ?? 0;
+      run.stopReason = message.stopReason ?? null;
       if (message.stopReason === "error" && message.errorMessage) {
         run.apiError = apiErrorSummary(message.errorMessage);
-        run.activity = "API error";
         log(`error: ${message.errorMessage}`);
-        return true;
+        return;
       }
       const text = (message.content ?? [])
         .flatMap((c) => (c.type === "text" && c.text ? [c.text] : []))
         .join("\n")
         .trim();
-      if (text) log(text);
-      return false;
+      if (text) {
+        run.said = text;
+        log(text);
+      }
+      return;
     }
-    default:
-      return false;
+    case "agent_end":
+      if (event.isTerminal === false) return;
+      run.done = true;
+      enter("finishing");
+      return;
   }
+}
+
+/** Theme colors the watch draws with; pi's and omp's themes have them all. */
+type WatchColor = "accent" | "dim" | "success" | "warning" | "error";
+
+interface WatchTheme {
+  fg(color: WatchColor, text: string): string;
+}
+
+/** For notifications, which take plain text. */
+const PLAIN_THEME: WatchTheme = { fg: (_color, text) => text };
+
+const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+function spinnerFrame(now: number): string {
+  return SPINNER[Math.floor(now / WATCH_TICK_MS) % SPINNER.length];
+}
+
+/** `12s`, `2m05s`, `1h02m`. */
+function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+
+/** `just now`, `4m ago`, `2h ago`: coarse, so an idle footer rarely changes. */
+function formatAgo(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return "just now";
+  return m < 60 ? `${m}m ago` : `${Math.floor(m / 60)}h ago`;
+}
+
+/** What the run is doing now, and the time it has spent on it. */
+function runActivity(run: AgentRun, now: number): [string, string] {
+  const since = (start: number) => formatDuration(now - start);
+  switch (run.phase) {
+    case "tool": {
+      const step = [...run.calls.values()].at(-1)?.step;
+      if (step) return [step.label, since(step.startedAt)];
+      break;
+    }
+    case "retrying": {
+      const { retry } = run;
+      if (!retry) break;
+      const wait =
+        retry.at > now ? ` in ${formatDuration(retry.at - now)}` : "";
+      return [
+        `retry ${retry.attempt}/${retry.maxAttempts}${wait}: ${clip(retry.error, 50)}`,
+        "",
+      ];
+    }
+    case "compacting":
+      return ["compacting context", since(run.phaseSince)];
+    case "finishing":
+      return ["wrapping up", ""];
+    case "starting":
+      return ["starting", since(run.phaseSince)];
+  }
+  return ["thinking", since(run.phaseSince)];
+}
+
+/** The watch's footer: its file, and what its agent is doing or last did. */
+function watchStatusLine(
+  watch: AnnotationWatch,
+  theme: WatchTheme,
+  now: number,
+): string {
+  const sep = theme.fg("dim", " · ");
+  const name = `watch "${watch.file}"`;
+  const { run, last } = watch;
+  if (run) {
+    const [what, time] = runActivity(run, now);
+    const color = run.phase === "retrying" ? "warning" : "accent";
+    let status = `${theme.fg(color, spinnerFrame(now))} ${name}${sep}${repliedCount(run)}/${run.requests.length} replied${sep}`;
+    status += run.phase === "retrying" ? theme.fg("warning", what) : what;
+    if (time) status += ` ${theme.fg("dim", time)}`;
+    if (watch.queue.length) {
+      status += sep + theme.fg("dim", `${watch.queue.length} queued`);
+    }
+    return status;
+  }
+  if (last?.failure) {
+    return `${theme.fg("error", "✗")} ${name}${sep}${theme.fg("error", `last run failed ${formatAgo(now - last.endedAt)}`)}`;
+  }
+  const idle = last
+    ? `last run ${formatAgo(now - last.endedAt)}, ${repliedCount(last.run)}/${last.run.requests.length} replied`
+    : "idle";
+  return theme.fg("dim", `○ ${name} · ${idle}`);
+}
+
+function requestLine(
+  request: RunRequest,
+  theme: WatchTheme,
+  running: boolean,
+): string {
+  const { reply } = request;
+  const icon =
+    reply === undefined
+      ? theme.fg("dim", "○")
+      : /^question\b/i.test(reply)
+        ? theme.fg("warning", "?")
+        : theme.fg("success", "✓");
+  const asked = theme.fg("dim", `"${clip(collapse(request.label), 40)}"`);
+  const answer =
+    reply !== undefined
+      ? `${theme.fg("dim", " → ")}${reply}`
+      : running
+        ? ""
+        : theme.fg("dim", " → no reply");
+  return `  ${icon} ${request.name} ${asked}${answer}`;
+}
+
+function stepLine(step: AgentStep, theme: WatchTheme, now: number): string {
+  const icon =
+    step.endedAt === undefined
+      ? theme.fg("accent", spinnerFrame(now))
+      : step.error
+        ? theme.fg("error", "✗")
+        : theme.fg("success", "✓");
+  const time = formatDuration((step.endedAt ?? now) - step.startedAt);
+  const error = step.error ? ` ${theme.fg("error", step.error)}` : "";
+  return `  ${icon} ${step.label} ${theme.fg("dim", time)}${error}`;
+}
+
+/**
+ * The watch's details: its requests with their replies, the agent's latest
+ * steps and words, and the log. At most 10 lines, which pi and omp both cap
+ * widgets at.
+ */
+function watchDetailLines(
+  watch: AnnotationWatch,
+  theme: WatchTheme,
+  now: number,
+  width: number,
+): string[] {
+  const sep = theme.fg("dim", " · ");
+  const { run, last } = watch;
+  const shown = run ?? last?.run;
+  let head = `${theme.fg("accent", "Figma watch")} "${watch.file}"${sep}`;
+  if (run) {
+    head += `run ${formatDuration(now - run.startedAt)}`;
+  } else if (last) {
+    head += `idle${sep}last run ${formatAgo(now - last.endedAt)}, took ${formatDuration(last.endedAt - last.run.startedAt)}`;
+  } else {
+    head += `idle${sep}waiting for "${AGENT_CATEGORY}" annotations`;
+  }
+  if (shown) {
+    const steps = shown.steps.length;
+    head += `${sep}${repliedCount(shown)}/${shown.requests.length} replied${sep}${steps} ${steps === 1 ? "step" : "steps"}`;
+    if (shown.cost) head += `${sep}$${shown.cost.toFixed(2)}`;
+  }
+  const lines = [head];
+  if (!run && last?.failure) {
+    lines.push(`  ${theme.fg("error", `✗ ${last.failure}`)}`);
+  }
+  if (shown) {
+    const room = run ? 3 : 5;
+    for (const request of shown.requests.slice(0, room)) {
+      lines.push(requestLine(request, theme, Boolean(run)));
+    }
+    if (shown.requests.length > room) {
+      lines.push(theme.fg("dim", `  +${shown.requests.length - room} more`));
+    }
+  }
+  if (run) {
+    const inTool = run.phase === "tool";
+    for (const step of run.steps.slice(inTool ? -3 : -2)) {
+      lines.push(stepLine(step, theme, now));
+    }
+    if (!inTool) {
+      const [what, time] = runActivity(run, now);
+      const color = run.phase === "retrying" ? "warning" : "accent";
+      lines.push(
+        `  ${theme.fg(color, spinnerFrame(now))} ${what}${time ? ` ${theme.fg("dim", time)}` : ""}`,
+      );
+    }
+  }
+  const said = shown ? collapse(shown.said) : "";
+  if (said) {
+    // While it streams in, the newest words; once written, the first.
+    const room = Math.max(10, width - 6);
+    const text =
+      shown?.saying && said.length > room ? `…${said.slice(1 - room)}` : said;
+    lines.push(`  ${theme.fg("dim", `› ${text}`)}`);
+  }
+  const queued = watch.queue.length ? `${watch.queue.length} queued · ` : "";
+  lines.push(`  ${theme.fg("dim", `${queued}log ${WATCH_LOG}`)}`);
+  return lines.map((line) => truncateToWidth(line, width));
 }
 
 /** Match a connected file by connection id or unique file name. */
@@ -1546,36 +1936,15 @@ export default function (pi: ExtensionAPI) {
   // background agent: a headless run of this CLI, which loads this extension
   // too, with FIGMA_LABOR_FILE set to the watched file. One run at a time;
   // requests that arrive meanwhile wait for the next. The session only shows
-  // a footer status that follows the run, a notification when a run ends, and
-  // a warning when an annotation changes on a group, which plugins can't read.
-  interface AnnotationWatch {
-    file: string;
-    ctx: {
-      ui: {
-        setStatus(key: string, value: string | undefined): void;
-        notify(message: string, type?: "info" | "warning" | "error"): void;
-      };
-    };
-    since: number | null;
-    /** nodeId + label of every request already handed to the agent. */
-    sent: Set<string>;
-    /** Groups whose annotation changes the watch has said it can't read. */
-    warned: Set<string>;
-    /** Requests waiting for the running agent to finish. */
-    queue: AnnotationRequest[];
-    /** The background agent's current run. */
-    run: AgentRun | null;
-    /** Whether the last run ended in an error. */
-    failed: boolean;
-    timer?: ReturnType<typeof setInterval>;
-    polling: boolean;
-  }
+  // a footer status that follows the run, details under the editor while
+  // tool output is expanded, a notification when a run ends, and a warning
+  // when an annotation changes on a group, which plugins can't read.
   let annotationWatch: AnnotationWatch | null = null;
 
   /** Update the watch's UI, ignoring a context gone stale with its session. */
   function watchUi(
     watch: AnnotationWatch,
-    update: (ui: AnnotationWatch["ctx"]["ui"]) => void,
+    update: (ui: ExtensionContext["ui"]) => void,
   ) {
     try {
       update(watch.ctx.ui);
@@ -1584,25 +1953,57 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function showWatchStatus(watch: AnnotationWatch) {
-    const { run } = watch;
-    let status = `watching "${watch.file}"`;
-    if (run) {
-      status += ` · agent ${run.replied}/${run.requests} replied · ${run.activity}`;
-      if (watch.queue.length) status += ` · ${watch.queue.length} queued`;
-    } else if (watch.failed) {
-      status += " · last run failed";
-    }
-    watchUi(watch, (ui) => ui.setStatus("labor-watch", status));
+  /** Redraw the watch's footer, and its details while tool output is expanded. */
+  function drawWatch(watch: AnnotationWatch) {
+    const now = Date.now();
+    watchUi(watch, (ui) => {
+      const status = watchStatusLine(watch, ui.theme, now);
+      if (status !== watch.status) {
+        watch.status = status;
+        ui.setStatus("labor-watch", status);
+      }
+      // Expanding tool output (ctrl+o) expands the watch too.
+      const expanded = ui.getToolsExpanded?.() === true;
+      if (expanded && !watch.details) {
+        const details: NonNullable<AnnotationWatch["details"]> = {
+          tui: null,
+          theme: ui.theme,
+          width: 80,
+          text: "",
+        };
+        watch.details = details;
+        ui.setWidget(
+          "labor-watch",
+          (tui, theme) => {
+            details.tui = tui;
+            details.theme = theme;
+            return {
+              render(width: number) {
+                const lines = watchDetailLines(watch, theme, Date.now(), width);
+                details.width = width;
+                details.text = lines.join("\n");
+                return lines;
+              },
+              invalidate() {},
+            };
+          },
+          { placement: "belowEditor" },
+        );
+      } else if (!expanded && watch.details) {
+        watch.details = null;
+        ui.setWidget("labor-watch", undefined);
+      } else if (watch.details?.tui) {
+        const { tui, theme, width, text } = watch.details;
+        if (watchDetailLines(watch, theme, now, width).join("\n") !== text) {
+          tui.requestRender();
+        }
+      }
+    });
   }
 
   /** Start the background agent on the queued requests unless it's running. */
   function runAnnotationAgent(watch: AnnotationWatch) {
-    if (watch.run) {
-      showWatchStatus(watch); // The queue may have grown.
-      return;
-    }
-    if (!watch.queue.length) return;
+    if (watch.run || !watch.queue.length) return;
     const requests = watch.queue.splice(0);
     const count =
       requests.length === 1 ? "1 request" : `${requests.length} requests`;
@@ -1629,19 +2030,34 @@ export default function (pi: ExtensionAPI) {
       ],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
+    const startedAt = Date.now();
     const run: AgentRun = {
       process: agent,
-      requests: requests.length,
-      replied: 0,
-      activity: "starting",
+      requests: requests.map((request) => ({ ...request })),
+      startedAt,
+      phase: "starting",
+      phaseSince: startedAt,
       calls: new Map(),
+      steps: [],
+      said: "",
+      saying: false,
+      cost: 0,
+      retry: null,
       apiError: null,
+      stopReason: null,
+      done: false,
     };
     watch.run = run;
-    watch.failed = false;
     createInterface({ input: agent.stdout }).on("line", (line) => {
-      if (followAgentLine(run, line, write) && watch.run === run) {
-        showWatchStatus(watch);
+      followAgentLine(run, line, write);
+      if (run.done && !run.endTimer) {
+        run.endTimer = setTimeout(() => {
+          write("· the agent is done; ending its process");
+          agent.kill("SIGTERM");
+        }, AGENT_END_GRACE_MS);
+      } else if (!run.done && run.endTimer) {
+        clearTimeout(run.endTimer);
+        run.endTimer = undefined;
       }
     });
     agent.stderr.pipe(log, { end: false });
@@ -1650,24 +2066,42 @@ export default function (pi: ExtensionAPI) {
     const finish = (failure: string | null) => {
       if (finished) return;
       finished = true;
+      clearTimeout(run.endTimer);
+      const endedAt = Date.now();
+      const reason = failure && (run.apiError ?? failure);
+      const replied = repliedCount(run);
+      const took = formatDuration(endedAt - run.startedAt);
+      write(
+        `== ${reason ? `stopped: ${reason}` : "done"}; ${replied} of ${count} replied in ${took}`,
+      );
       log.end();
       // Stopped with the watch, which killed it.
       if (annotationWatch !== watch || watch.run !== run) return;
       watch.run = null;
-      watch.failed = failure !== null;
-      const message = failure
-        ? `The annotation agent stopped in "${watch.file}" with ${run.replied} of ${count} replied: ${run.apiError ?? failure}. Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
-        : `The annotation agent replied on ${run.replied} of ${count} in "${watch.file}".`;
-      watchUi(watch, (ui) => ui.notify(message, failure ? "error" : "info"));
-      showWatchStatus(watch);
+      watch.last = { run, endedAt, failure: reason };
+      const message = reason
+        ? `The annotation agent stopped in "${watch.file}" after ${took} with ${replied} of ${count} replied: ${reason}. Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
+        : `The annotation agent replied on ${replied} of ${count} in "${watch.file}" in ${took}.`;
+      const lines = run.requests.map((r) => requestLine(r, PLAIN_THEME, false));
+      watchUi(watch, (ui) =>
+        ui.notify([message, ...lines].join("\n"), reason ? "error" : "info"),
+      );
       runAnnotationAgent(watch);
     };
     agent.on("error", (err) => finish(err.message));
     agent.on("close", (code, signal) => {
-      if (code === 0) finish(null);
-      else finish(signal ? `killed by ${signal}` : `exit code ${code}`);
+      if (run.done) {
+        // Its exit code is ours once the timer ended it; the agent's last
+        // message says how the run went.
+        const failed =
+          run.stopReason === "error" || run.stopReason === "aborted";
+        finish(failed ? `its last request ended in ${run.stopReason}` : null);
+      } else if (code === 0) {
+        finish(null);
+      } else {
+        finish(signal ? `killed by ${signal}` : `exit code ${code}`);
+      }
     });
-    showWatchStatus(watch);
   }
 
   async function pollAnnotationWatch(
@@ -1727,9 +2161,16 @@ export default function (pi: ExtensionAPI) {
     if (!watch) return null;
     annotationWatch = null;
     clearInterval(watch.timer);
-    watch.run?.process.kill("SIGTERM");
+    clearInterval(watch.ticker);
+    if (watch.run) {
+      clearTimeout(watch.run.endTimer);
+      watch.run.process.kill("SIGTERM");
+    }
     watch.run = null;
-    watchUi(watch, (ui) => ui.setStatus("labor-watch", undefined));
+    watchUi(watch, (ui) => {
+      ui.setStatus("labor-watch", undefined);
+      ui.setWidget("labor-watch", undefined);
+    });
     return watch.file;
   }
 
@@ -1938,8 +2379,17 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (annotationWatch && !arg) {
+        const details = watchDetailLines(
+          annotationWatch,
+          PLAIN_THEME,
+          Date.now(),
+          500,
+        );
         ctx.ui.notify(
-          `Watching "${annotationWatch.file}" for "${AGENT_CATEGORY}" annotations. /figma-labor-watch off stops.`,
+          [
+            ...details,
+            "Expand tool output (ctrl+o) to keep these details under the editor. /figma-labor-watch off stops.",
+          ].join("\n"),
           "info",
         );
         return;
@@ -1982,8 +2432,9 @@ export default function (pi: ExtensionAPI) {
         warned: new Set(),
         queue: [],
         run: null,
-        failed: false,
+        last: null,
         polling: true,
+        details: null,
       };
       annotationWatch = watch;
       let first: { createdCategory: boolean };
@@ -2014,12 +2465,13 @@ export default function (pi: ExtensionAPI) {
           watch.polling = false;
         }
       }, 3000);
-      showWatchStatus(watch);
+      watch.ticker = setInterval(() => drawWatch(watch), WATCH_TICK_MS);
+      drawWatch(watch);
       const created = first.createdCategory
         ? ` Added the "${AGENT_CATEGORY}" annotation category to the file.`
         : "";
       ctx.ui.notify(
-        `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created}`,
+        `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created} Expand tool output (ctrl+o) to see what the agent is doing.`,
         "success",
       );
     },
