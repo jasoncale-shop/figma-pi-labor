@@ -671,6 +671,9 @@ return result;
 // A watcher's first poll, and any poll after the plugin restarted, scans the
 // whole document instead. The listener carries a version so a newer extension
 // replaces the one an older one installed.
+// Figma reports annotation changes on groups but gives plugins no annotations
+// property on them, so a poll can't read those. It names each such group once
+// per watch (args.warned holds the ones named) in a Figma toast and returns it.
 const WATCH_ANNOTATIONS_SCRIPT = `
 let createdCategory = args.ensureCategory ? (await ensureAgentCategory()).created : false;
 let state = globalThis.__laborAnnotationWatch;
@@ -706,12 +709,17 @@ if (state?.version !== 2) {
 const now = Date.now();
 for (const [id, entry] of state.changed) if (now - entry.at > 600000) state.changed.delete(id);
 let nodes = [];
+const unreadable = [];
 const copies = [];
 if (full) {
   nodes = figma.root.findAll(hasAnnotations);
 } else {
   for (const entry of state.changed.values()) {
     if (entry.at < args.since || entry.node.removed) continue;
+    if (!("annotations" in entry.node)) {
+      if (!args.warned.includes(entry.node.id)) unreadable.push({ nodeId: entry.node.id, name: entry.node.name });
+      continue;
+    }
     if (!entry.created) {
       nodes.push(entry.node);
       continue;
@@ -755,7 +763,11 @@ for (const node of nodes) {
     }
   });
 }
-return { since: now, requests, createdCategory };
+if (unreadable.length) {
+  const names = unreadable.map((n) => '"' + n.name + '"').join(", ");
+  figma.notify("Labor can't read annotations on groups (" + names + "). Annotate a frame or layer instead.", { timeout: 10000 });
+}
+return { since: now, requests, unreadable, createdCategory };
 `;
 
 // labor_clone_node: a clone keeps its source's annotations. Drop the Agent
@@ -1343,18 +1355,21 @@ export default function (pi: ExtensionAPI) {
   // background agent: a headless run of this CLI, which loads this extension
   // too, with FIGMA_LABOR_FILE set to the watched file. One run at a time;
   // requests that arrive meanwhile wait for the next. The session only shows
-  // a footer status and a notification when a run ends.
+  // a footer status, a notification when a run ends, and a warning when an
+  // annotation changes on a group, which plugins can't read.
   interface AnnotationWatch {
     file: string;
     ctx: {
       ui: {
         setStatus(key: string, value: string | undefined): void;
-        notify(message: string, type?: "info" | "error"): void;
+        notify(message: string, type?: "info" | "warning" | "error"): void;
       };
     };
     since: number | null;
     /** nodeId + label of every request already handed to the agent. */
     sent: Set<string>;
+    /** Groups whose annotation changes the watch has said it can't read. */
+    warned: Set<string>;
     /** Requests waiting for the running agent to finish. */
     queue: AnnotationRequest[];
     agent: ChildProcess | null;
@@ -1438,6 +1453,7 @@ export default function (pi: ExtensionAPI) {
         code: annotationScript(WATCH_ANNOTATIONS_SCRIPT, {
           since: watch.since,
           ensureCategory,
+          warned: [...watch.warned],
         }),
       },
       { target: watch.file, timeout: 60_000 },
@@ -1448,12 +1464,23 @@ export default function (pi: ExtensionAPI) {
           "The annotation scan returned nothing.",
       );
     }
-    const { since, requests, createdCategory } = result as {
+    const { since, requests, unreadable, createdCategory } = result as {
       since: number;
       requests: AnnotationRequest[];
+      unreadable: { nodeId: string; name: string }[];
       createdCategory: boolean;
     };
     watch.since = since;
+    if (unreadable.length && annotationWatch === watch) {
+      for (const node of unreadable) watch.warned.add(node.nodeId);
+      const names = unreadable.map((n) => `"${n.name}" (${n.nodeId})`);
+      watchUi(watch, (ui) =>
+        ui.notify(
+          `Figma gives plugins no annotations on groups, so the watch can't read the one on ${names.join(", ")} in "${watch.file}". Annotate a frame or layer instead.`,
+          "warning",
+        ),
+      );
+    }
     const fresh = requests.filter((request) => {
       const key = `${request.nodeId}\n${request.label}`;
       if (watch.sent.has(key)) return false;
@@ -1725,6 +1752,7 @@ export default function (pi: ExtensionAPI) {
         ctx,
         since: null,
         sent: new Set(),
+        warned: new Set(),
         queue: [],
         agent: null,
         polling: true,
@@ -1787,7 +1815,10 @@ export default function (pi: ExtensionAPI) {
       if (!status) {
         return {
           content: [
-            { type: "text" as const, text: "figma-labor bridge is not running." },
+            {
+              type: "text" as const,
+              text: "figma-labor bridge is not running.",
+            },
           ],
           isError: true,
         };
@@ -1962,7 +1993,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "labor_get_annotations",
     label: "Get Annotations",
-    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category, or whose text starts with "agent:", are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes.`,
+    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category, or whose text starts with "agent:", are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes. Figma gives plugins no annotations on groups, so those never appear.`,
     parameters: Type.Object({
       nodeId: Type.Optional(
         Type.String({ description: "Search this node and its descendants" }),

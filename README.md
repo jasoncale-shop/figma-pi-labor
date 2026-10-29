@@ -85,6 +85,8 @@ The Plugin API can't read comments, but it can read and write annotations, so an
 
 A request counts as pending until its last paragraph is a ■ reply. Other categories (Development, Content, …) stay specs: the agent reads them for context but doesn't act on them.
 
+Annotate frames, components, instances, shapes, or text, not groups: Figma gives plugins no annotations on groups, so the agent can't see those. While the watch runs, an annotation added or edited on a group gets a Figma toast and a session warning instead of a reply.
+
 Copies keep their source's annotations, but not its requests: `labor_clone_node` drops the **Agent** annotations a clone copied, and while the watch runs, so does duplicating, pasting, or cloning by any means, as long as the original is still in the file. A cut-and-paste keeps its request, and other categories are always kept.
 
 `/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p` or `pi -p`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: the footer shows `· agent working` during a run, and a notification reports each run's end. One run goes at a time, and requests that arrive meanwhile wait for the next. Output goes to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
@@ -145,7 +147,6 @@ Tools are registered when the desktop MCP server is enabled. `/figma-mcp` to see
 | Components, variants, styles, variables    | ✓            | —                                              | —                                              |
 | MCP `get_figjam`                           | —            | ✓                                              | —                                              |
 | Desktop MCP screenshots                    | ✓            | ✓                                              | Runtime-dependent; local verification fallback |
-
 
 ## Available skills
 
