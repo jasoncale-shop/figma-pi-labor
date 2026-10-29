@@ -43,14 +43,14 @@ FIGMA_MCP_PORT=3845 pi
 
 ### Commands
 
-| Command                     | Description                                                      |
-| --------------------------- | ---------------------------------------------------------------- |
-| `/figma-labor-start`        | Start bridge server manually                                     |
-| `/figma-labor-stop`         | Stop bridge server manually                                      |
-| `/figma-labor`              | Show bridge status and connected Figma files                     |
-| `/figma-labor-watch [file]` | Hand new "Agent" annotations in this session's file to the agent |
-| `/figma-labor-watch off`    | Stop watching annotations                                        |
-| `/figma-mcp`                | Show Figma MCP server status and list available tools            |
+| Command                     | Description                                                               |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `/figma-labor-start`        | Start bridge server manually                                              |
+| `/figma-labor-stop`         | Stop bridge server manually                                               |
+| `/figma-labor`              | Show bridge status and connected Figma files                              |
+| `/figma-labor-watch [file]` | Hand new "Agent" annotations in this session's file to a background agent |
+| `/figma-labor-watch off`    | Stop watching annotations                                                 |
+| `/figma-mcp`                | Show Figma MCP server status and list available tools                     |
 
 ### Footer status
 
@@ -61,6 +61,7 @@ labor ◌ M     MCP working (Figma is open and MCP is enabled)
 labor P M     plugin is running and MCP is working
 labor P2 M    plugin is open in 2 files
 watching "x"  /figma-labor-watch is on for file "x"
+watching "x" · agent working  its background agent is handling requests
 ```
 
 ### Multiple files
@@ -78,7 +79,7 @@ Open _Pi Labor_ in several files and run one agent per file. The bridge keeps a 
 The Plugin API can't read comments, but it can read and write annotations, so annotations are how a designer asks the agent for changes from inside Figma:
 
 1. Annotate a layer and put the annotation in the **Agent** category, e.g. "make this red". Or start the text with `agent:` in any category, e.g. "agent: make this red"; the agent files it under **Agent** and drops the prefix
-2. Ask pi to work through the annotations, or run `/figma-labor-watch` to have new ones sent to the agent as they appear
+2. Ask pi to work through the annotations, or run `/figma-labor-watch` to have a background agent handle new ones as they appear
 3. The agent makes each change, then replies on the annotation with a paragraph such as `■ Done: filled Frame 1 with red` or `■ Question: which red?`
 4. Delete the annotation when you're happy. To follow up, add a paragraph under the reply; that makes the request pending again
 
@@ -86,7 +87,7 @@ A request counts as pending until its last paragraph is a ■ reply. Other categ
 
 Copies keep their source's annotations, but not its requests: `labor_clone_node` drops the **Agent** annotations a clone copied, and while the watch runs, so does duplicating, pasting, or cloning by any means, as long as the original is still in the file. A cut-and-paste keeps its request, and other categories are always kept.
 
-`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, sends pending requests right away, then sends each new or edited one within a few seconds. An idle agent starts on them at once; a busy one gets them after its current turn. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`. Switching the session to another file with `labor_use_file` stops it.
+`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p` or `pi -p`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: the footer shows `· agent working` during a run, and a notification reports each run's end. One run goes at a time, and requests that arrive meanwhile wait for the next. Output goes to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
 
 ## MCP ↔ Labor
 

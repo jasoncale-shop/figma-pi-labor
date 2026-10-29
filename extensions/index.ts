@@ -43,7 +43,8 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { createWriteStream, readFileSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -61,6 +62,10 @@ const BRIDGE_URL = "http://127.0.0.1:3846";
 const BRIDGE_BIN = join(__dirname, "bridge.js");
 const MCP_URL = `http://127.0.0.1:${process.env.FIGMA_MCP_PORT ?? "3845"}/mcp`;
 const MAX_OUTPUT_BYTES = 50 * 1024;
+/** The CLI running this extension; the annotation watch starts its agent with it. */
+const HOST_CLI = process.argv[1]?.includes("@oh-my-pi/") ? "omp" : "pi";
+/** Output of the annotation watch's background agent runs. */
+const WATCH_LOG = join(tmpdir(), "figma-labor-watch.log");
 
 // ## MCP STATE
 
@@ -816,9 +821,9 @@ function watchMessage(file: string, requests: AnnotationRequest[]): string {
   const count =
     requests.length === 1 ? "1 new request" : `${requests.length} new requests`;
   return [
-    `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}".`,
+    `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}". Labor tools already target that file. You run in the background, so your replies on the annotations are the only report the designer sees.`,
     ...lines,
-    `Handle each on its node and verify, then reply on that annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need.`,
+    `Handle each on its node and verify, then reply on that annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply.`,
   ].join("\n");
 }
 
@@ -1315,7 +1320,8 @@ export default function (pi: ExtensionAPI) {
   // File this agent's Labor tools target: a file name, or a connection id when
   // the name is ambiguous. Each agent (subagents included) gets its own. The
   // first command that runs with a single connected file pins it, so a file
-  // connecting later can't redirect this agent's writes.
+  // connecting later can't redirect this agent's writes. FIGMA_LABOR_FILE
+  // presets it, which is how the annotation watch's agent gets its file.
   let targetFile: string | null = null;
 
   function runTool(
@@ -1333,19 +1339,91 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Annotation watch: off until /figma-labor-watch turns it on for one file,
-  // this session's target. Polls that file and sends new Agent requests to the
-  // agent: as a new turn when it's idle, queued behind the running turn when
-  // it's busy.
+  // this session's target. Polls that file and hands new Agent requests to a
+  // background agent: a headless run of this CLI, which loads this extension
+  // too, with FIGMA_LABOR_FILE set to the watched file. One run at a time;
+  // requests that arrive meanwhile wait for the next. The session only shows
+  // a footer status and a notification when a run ends.
   interface AnnotationWatch {
     file: string;
-    ctx: StatusContext & { isIdle(): boolean };
+    ctx: {
+      ui: {
+        setStatus(key: string, value: string | undefined): void;
+        notify(message: string, type?: "info" | "error"): void;
+      };
+    };
     since: number | null;
-    /** nodeId + label of every request already sent to the agent. */
+    /** nodeId + label of every request already handed to the agent. */
     sent: Set<string>;
+    /** Requests waiting for the running agent to finish. */
+    queue: AnnotationRequest[];
+    agent: ChildProcess | null;
     timer?: ReturnType<typeof setInterval>;
     polling: boolean;
   }
   let annotationWatch: AnnotationWatch | null = null;
+
+  /** Update the watch's UI, ignoring a context gone stale with its session. */
+  function watchUi(
+    watch: AnnotationWatch,
+    update: (ui: AnnotationWatch["ctx"]["ui"]) => void,
+  ) {
+    try {
+      update(watch.ctx.ui);
+    } catch (error) {
+      if (!isStaleSessionContextError(error)) throw error;
+    }
+  }
+
+  function showWatchStatus(watch: AnnotationWatch) {
+    const working = watch.agent ? " · agent working" : "";
+    watchUi(watch, (ui) =>
+      ui.setStatus("labor-watch", `watching "${watch.file}"${working}`),
+    );
+  }
+
+  /** Start the background agent on the queued requests unless it's running. */
+  function runAnnotationAgent(watch: AnnotationWatch) {
+    if (watch.agent || !watch.queue.length) return;
+    const requests = watch.queue.splice(0);
+    const count =
+      requests.length === 1 ? "1 request" : `${requests.length} requests`;
+    const log = createWriteStream(WATCH_LOG, { flags: "a" });
+    log.write(`\n== ${new Date().toISOString()} "${watch.file}", ${count}\n`);
+    const agent = spawn(
+      HOST_CLI,
+      ["-p", "--no-session", watchMessage(watch.file, requests)],
+      {
+        env: { ...process.env, FIGMA_LABOR_FILE: watch.file },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    watch.agent = agent;
+    agent.stdout.pipe(log, { end: false });
+    agent.stderr.pipe(log, { end: false });
+    let finished = false;
+    // "error" (it couldn't start) can be followed by "close"; handle one.
+    const finish = (failure: string | null) => {
+      if (finished) return;
+      finished = true;
+      log.end();
+      // Stopped with the watch, which killed it.
+      if (annotationWatch !== watch || watch.agent !== agent) return;
+      watch.agent = null;
+      const message = failure
+        ? `The annotation agent stopped on ${count} in "${watch.file}" (${failure}). Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
+        : `The annotation agent handled ${count} in "${watch.file}".`;
+      watchUi(watch, (ui) => ui.notify(message, failure ? "error" : "info"));
+      showWatchStatus(watch);
+      runAnnotationAgent(watch);
+    };
+    agent.on("error", (err) => finish(err.message));
+    agent.on("close", (code, signal) => {
+      if (code === 0) finish(null);
+      else finish(signal ? `killed by ${signal}` : `exit code ${code}`);
+    });
+    showWatchStatus(watch);
+  }
 
   async function pollAnnotationWatch(
     watch: AnnotationWatch,
@@ -1380,12 +1458,8 @@ export default function (pi: ExtensionAPI) {
       return true;
     });
     if (fresh.length && annotationWatch === watch) {
-      // "followUp" queues even when the agent is idle, so an idle session
-      // never starts a turn; use it only while a turn is running.
-      pi.sendUserMessage(
-        watchMessage(watch.file, fresh),
-        watch.ctx.isIdle() ? undefined : { deliverAs: "followUp" },
-      );
+      watch.queue.push(...fresh);
+      runAnnotationAgent(watch);
     }
     return { sent: fresh.length, createdCategory };
   }
@@ -1396,11 +1470,9 @@ export default function (pi: ExtensionAPI) {
     if (!watch) return null;
     annotationWatch = null;
     clearInterval(watch.timer);
-    try {
-      watch.ctx.ui.setStatus("labor-watch", undefined);
-    } catch (error) {
-      if (!isStaleSessionContextError(error)) throw error;
-    }
+    watch.agent?.kill("SIGTERM");
+    watch.agent = null;
+    watchUi(watch, (ui) => ui.setStatus("labor-watch", undefined));
     return watch.file;
   }
 
@@ -1445,7 +1517,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     stopAnnotationWatch();
-    targetFile = null;
+    targetFile = process.env.FIGMA_LABOR_FILE || null;
     bridgeStartupAbort?.abort();
     const run = ++bridgeSessionRun;
     const controller = new AbortController();
@@ -1595,7 +1667,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("figma-labor-watch", {
-    description: `Watch this session's Figma file for "${AGENT_CATEGORY}" annotations and send new ones to the agent. /figma-labor-watch <file> picks the file; /figma-labor-watch off stops`,
+    description: `Watch this session's Figma file for "${AGENT_CATEGORY}" annotations and hand new ones to a background agent. /figma-labor-watch <file> picks the file; /figma-labor-watch off stops`,
     handler: async (args, ctx) => {
       const arg = args.trim();
       if (arg === "off") {
@@ -1650,6 +1722,8 @@ export default function (pi: ExtensionAPI) {
         ctx,
         since: null,
         sent: new Set(),
+        queue: [],
+        agent: null,
         polling: true,
       };
       annotationWatch = watch;
@@ -1681,12 +1755,12 @@ export default function (pi: ExtensionAPI) {
           watch.polling = false;
         }
       }, 3000);
-      ctx.ui.setStatus("labor-watch", `watching "${watch.file}"`);
+      showWatchStatus(watch);
       const created = first.createdCategory
         ? ` Added the "${AGENT_CATEGORY}" annotation category to the file.`
         : "";
       const sent = first.sent
-        ? ` Sent ${first.sent} pending request${first.sent === 1 ? "" : "s"} to the agent.`
+        ? ` Handed ${first.sent} pending request${first.sent === 1 ? "" : "s"} to a background agent.`
         : " No pending requests yet.";
       ctx.ui.notify(
         `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created}${sent}`,
