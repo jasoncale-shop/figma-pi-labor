@@ -122,7 +122,7 @@ Then verify structure and native FigJam properties with:
 - `labor_get_node`
 - `labor_get_children`
 
-If `get_screenshot` is unavailable, use the image from `get_figjam` or `labor_zoom_to_node` for manual inspection.
+If `get_screenshot` is unavailable, use the image from `get_figjam` or `labor_export_node`.
 
 Check:
 

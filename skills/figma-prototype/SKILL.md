@@ -15,7 +15,7 @@ Work with native Figma prototype interactions using labor tools.
 - Use this verification pattern:
   - `labor: labor_run_script` to read back `node.reactions`
   - `labor: labor_zoom_to_node` on source and destination nodes
-  - `mcp: get_screenshot` when visual placement matters
+  - `mcp: get_screenshot` when visual placement matters, or `labor: labor_export_node` without MCP
 - If runtime behavior still matters, ask the user to test in Present mode
 
 ## Discovery first
@@ -164,7 +164,7 @@ return node.reactions;
   - confirm intended order
 - For overlays or visually sensitive transitions:
   - use `get_screenshot` when available
-  - otherwise zoom to source and destination and inspect manually
+  - otherwise `labor_export_node` on source and destination
 
 ## Gotchas
 

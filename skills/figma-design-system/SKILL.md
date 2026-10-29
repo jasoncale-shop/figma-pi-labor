@@ -15,7 +15,7 @@ Work with variables, tokens, components, variants, and styles using labor tools.
 - Verify the first correct pattern before batching
 - Use this verification pattern:
   - `mcp: get_screenshot`
-  - `labor: labor_zoom_to_node` + manual inspect
+  - `labor: labor_export_node`
 
 ## Discovery first
 
@@ -797,7 +797,7 @@ Size=Medium, Style=Primary, State=Default
 | ---------- | --------------------------------------------------------- | -------------------------------------------------------------------------- |
 | Discovery  | list collections, variables, components                   | `labor_run_script` read-only                                               |
 | Tokens     | create collections, primitives, semantics, scopes, syntax | `labor_run_script` read-back                                               |
-| Components | create base, variants, properties, links, layout          | `mcp: get_screenshot` \| `labor: labor_zoom_to_node` + manual inspect      |
+| Components | create base, variants, properties, links, layout          | `mcp: get_screenshot` \| `labor: labor_export_node`                        |
 | Styles     | create text and effect styles                             | `labor_run_script` read-back                                               |
 | Bindings   | bind colors, spacing, radii                               | `mcp: get_screenshot` \| `labor: labor_get_node_full` + `labor_run_script` |
 

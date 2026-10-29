@@ -17,7 +17,7 @@ Build new elements and compose them into existing layouts with labor tools.
 - Check for clipped text, overlaps, placeholder text, and wrong variants
 - At the end, always run `get_screenshot` on the created or changed root node for the final visual audit
 - Follow the screenshot with a Labor re-read when layout, hierarchy, or visibility matters
-- If `get_screenshot` is unavailable, use `labor_zoom_to_node` and manually inspect
+- If `get_screenshot` is unavailable, use `labor_export_node` on the same node
 
 ## Script size
 
@@ -284,7 +284,7 @@ return { ok: true, id: test.id, children: parent.children.length };
 - Every `labor_run_script` returned useful output
 - New element was verified in isolation
   - `mcp: get_screenshot`
-  - `labor: labor_zoom_to_node` + manual inspect
+  - `labor: labor_export_node`
 - Parent context was verified when placement matters
   - `mcp: get_screenshot`
   - `labor: labor_get_node_full` + `labor_get_children`

@@ -30,6 +30,7 @@
  *   labor_move_node           Move a node to a different parent
  *   labor_select_node         Select a node and zoom to it
  *   labor_zoom_to_node        Zoom the viewport to a node without selecting it
+ *   labor_export_node         Export a node as a PNG image to look at
  *   labor_detach_instance     Detach an instance, converting it to a plain frame
  *   labor_run_script          Run arbitrary JS in the Figma plugin context
  *   labor_get_annotations     List annotations on the page, selection, a node, or the document
@@ -46,6 +47,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
@@ -312,6 +314,10 @@ function formatToolOutput(output: unknown): string {
   return JSON.stringify(output, null, 2) ?? "No result returned by Figma.";
 }
 
+type ToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; data: string };
+
 interface BridgeToolOptions {
   timeout?: number;
   signal?: AbortSignal;
@@ -322,6 +328,8 @@ interface BridgeToolOptions {
   onFile?: (file: BridgeFile) => void;
   /** Amends a successful result before it's shown. Must not throw. */
   after?: (result: unknown, file: BridgeFile | null) => Promise<unknown>;
+  /** Builds the tool's content from a successful result instead of showing it as JSON. */
+  content?: (result: unknown) => ToolContent[];
 }
 
 async function runBridgeTool(
@@ -384,6 +392,7 @@ async function runBridgeTool(
       };
     }
     const amended = opts?.after ? await opts.after(result, file) : result;
+    if (opts?.content) return { content: opts.content(amended) };
     const output = opts?.includeContext
       ? {
           file: file?.file ?? null,
@@ -402,6 +411,42 @@ async function runBridgeTool(
       isError: true,
     };
   }
+}
+
+// ## EXPORT
+
+/** Longest side, in pixels, of a labor_export_node image; model APIs reject or shrink bigger ones. */
+const EXPORT_MAX_SIDE = 2048;
+
+/** Exports a node as PNG in the plugin; the bytes come back base64-encoded. */
+function exportScript(nodeId: string, scale: number): string {
+  return `const args = ${JSON.stringify({ nodeId, scale, maxSide: EXPORT_MAX_SIDE })};
+const node = await figma.getNodeByIdAsync(args.nodeId);
+if (!node) return { error: "Node " + args.nodeId + " not found." };
+if (!("exportAsync" in node)) return { error: node.type + " nodes can't be exported." };
+const side = Math.max(node.width ?? 0, node.height ?? 0);
+const scale = side * args.scale > args.maxSide ? args.maxSide / side : args.scale;
+const bytes = await node.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: scale } });
+return { name: node.name, type: node.type, scale, png: figma.base64Encode(bytes) };`;
+}
+
+/** A caption with the PNG's real size, read from its IHDR chunk, then the image. */
+function exportContent(result: unknown): ToolContent[] {
+  const { name, type, scale, png } = result as {
+    name: string;
+    type: string;
+    scale: number;
+    png: string;
+  };
+  const header = Buffer.from(png.slice(0, 32), "base64");
+  const size = `${header.readUInt32BE(16)}×${header.readUInt32BE(20)}px`;
+  return [
+    {
+      type: "text",
+      text: `${type} "${name}" exported at ${Number(scale.toFixed(3))}x: ${size} PNG`,
+    },
+    { type: "image", mimeType: "image/png", data: png },
+  ];
 }
 
 // ## ANNOTATIONS
@@ -837,6 +882,152 @@ function watchMessage(file: string, requests: AnnotationRequest[]): string {
     ...lines,
     `Handle each on its node and verify, then reply on that annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply.`,
   ].join("\n");
+}
+
+/** Event fields the watch reads from its background agent's `--mode json` output. */
+interface AgentStreamEvent {
+  type?: string;
+  toolCallId?: string;
+  toolName?: string;
+  args?: Record<string, unknown>;
+  /** omp only: the call's `i` argument, a few words on what the step does. */
+  intent?: string;
+  isError?: boolean;
+  result?: { content?: { type: string; text?: string }[] };
+  message?: {
+    role?: string;
+    content?: { type: string; text?: string }[];
+    stopReason?: string;
+    errorMessage?: string;
+  };
+}
+
+/** A background agent run, as the footer and the run-end notification report it. */
+interface AgentRun {
+  process: ChildProcess;
+  requests: number;
+  /** Requests it has replied on. */
+  replied: number;
+  /** What it's doing now: the running tool call's intent, or "thinking". */
+  activity: string;
+  /** Running tool calls, by call id. */
+  calls: Map<string, { label: string; reply: boolean }>;
+  /** The last model API error; one ends the run unless a retry gets through. */
+  apiError: string | null;
+}
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** The tool a call runs: omp mounts most tools as xd:// devices, called by writing JSON args to the path. */
+function calledTool(
+  name: string,
+  args: Record<string, unknown> = {},
+): { name: string; args: Record<string, unknown> } {
+  const path = args.path;
+  if (
+    name !== "write" ||
+    typeof path !== "string" ||
+    !path.startsWith("xd://")
+  ) {
+    return { name, args };
+  }
+  let inner: unknown = null;
+  try {
+    inner = JSON.parse(String(args.content));
+  } catch {
+    // Not JSON; the device rejects it.
+  }
+  return {
+    name: path.slice("xd://".length),
+    args:
+      inner && typeof inner === "object"
+        ? (inner as Record<string, unknown>)
+        : {},
+  };
+}
+
+/** `400 Could not process image` out of `400 {"type":"error","error":{…,"message":"Could not process image"},…}`. */
+function apiErrorSummary(message: string): string {
+  const line = message.split("\n", 1)[0];
+  const brace = line.indexOf("{");
+  if (brace >= 0) {
+    try {
+      const body = JSON.parse(line.slice(brace)) as {
+        error?: { message?: unknown };
+      };
+      if (typeof body.error?.message === "string") {
+        return `${line.slice(0, brace)}${body.error.message}`.trim();
+      }
+    } catch {
+      // Not a JSON error body.
+    }
+  }
+  return clip(line, 200);
+}
+
+/**
+ * Apply one line of the agent's JSON output to its run and log a readable
+ * digest of it. Returns whether the footer needs an update.
+ */
+function followAgentLine(
+  run: AgentRun,
+  line: string,
+  log: (text: string) => void,
+): boolean {
+  let event: AgentStreamEvent;
+  try {
+    event = JSON.parse(line) as AgentStreamEvent;
+  } catch {
+    log(line);
+    return false;
+  }
+  const id = event.toolCallId ?? "";
+  switch (event.type) {
+    case "tool_execution_start": {
+      const tool = calledTool(event.toolName ?? "tool", event.args);
+      const label = clip(event.intent || tool.name, 60);
+      const reply =
+        tool.name === "labor_update_annotations" &&
+        tool.args.action === "reply";
+      run.calls.set(id, { label, reply });
+      run.activity = label;
+      log(`→ ${label}`);
+      return true;
+    }
+    case "tool_execution_end": {
+      const call = run.calls.get(id);
+      run.calls.delete(id);
+      if (event.isError) {
+        const text =
+          event.result?.content?.find((c) => c.type === "text")?.text ?? "";
+        log(`✗ ${call?.label ?? event.toolName}: ${clip(text, 300)}`);
+      } else if (call?.reply) {
+        run.replied++;
+      }
+      run.activity = [...run.calls.values()].at(-1)?.label ?? "thinking";
+      return true;
+    }
+    case "message_end": {
+      const { message } = event;
+      if (message?.role !== "assistant") return false;
+      if (message.stopReason === "error" && message.errorMessage) {
+        run.apiError = apiErrorSummary(message.errorMessage);
+        run.activity = "API error";
+        log(`error: ${message.errorMessage}`);
+        return true;
+      }
+      const text = (message.content ?? [])
+        .flatMap((c) => (c.type === "text" && c.text ? [c.text] : []))
+        .join("\n")
+        .trim();
+      if (text) log(text);
+      return false;
+    }
+    default:
+      return false;
+  }
 }
 
 /** Match a connected file by connection id or unique file name. */
@@ -1355,8 +1546,8 @@ export default function (pi: ExtensionAPI) {
   // background agent: a headless run of this CLI, which loads this extension
   // too, with FIGMA_LABOR_FILE set to the watched file. One run at a time;
   // requests that arrive meanwhile wait for the next. The session only shows
-  // a footer status, a notification when a run ends, and a warning when an
-  // annotation changes on a group, which plugins can't read.
+  // a footer status that follows the run, a notification when a run ends, and
+  // a warning when an annotation changes on a group, which plugins can't read.
   interface AnnotationWatch {
     file: string;
     ctx: {
@@ -1372,7 +1563,10 @@ export default function (pi: ExtensionAPI) {
     warned: Set<string>;
     /** Requests waiting for the running agent to finish. */
     queue: AnnotationRequest[];
-    agent: ChildProcess | null;
+    /** The background agent's current run. */
+    run: AgentRun | null;
+    /** Whether the last run ended in an error. */
+    failed: boolean;
     timer?: ReturnType<typeof setInterval>;
     polling: boolean;
   }
@@ -1391,33 +1585,65 @@ export default function (pi: ExtensionAPI) {
   }
 
   function showWatchStatus(watch: AnnotationWatch) {
-    const working = watch.agent ? " · agent working" : "";
-    watchUi(watch, (ui) =>
-      ui.setStatus("labor-watch", `watching "${watch.file}"${working}`),
-    );
+    const { run } = watch;
+    let status = `watching "${watch.file}"`;
+    if (run) {
+      status += ` · agent ${run.replied}/${run.requests} replied · ${run.activity}`;
+      if (watch.queue.length) status += ` · ${watch.queue.length} queued`;
+    } else if (watch.failed) {
+      status += " · last run failed";
+    }
+    watchUi(watch, (ui) => ui.setStatus("labor-watch", status));
   }
 
   /** Start the background agent on the queued requests unless it's running. */
   function runAnnotationAgent(watch: AnnotationWatch) {
-    if (watch.agent || !watch.queue.length) return;
+    if (watch.run) {
+      showWatchStatus(watch); // The queue may have grown.
+      return;
+    }
+    if (!watch.queue.length) return;
     const requests = watch.queue.splice(0);
     const count =
       requests.length === 1 ? "1 request" : `${requests.length} requests`;
     const log = createWriteStream(WATCH_LOG, { flags: "a" });
-    log.write(`\n== ${new Date().toISOString()} "${watch.file}", ${count}\n`);
+    const write = (text: string) => {
+      if (!log.writableEnded) log.write(`${text}\n`);
+    };
+    write(`\n== ${new Date().toISOString()} "${watch.file}", ${count}`);
     // omp gives its shells and kernels the session's file and artifacts dir;
     // the agent runs without a session, so it mustn't inherit them.
     const env = { ...process.env, FIGMA_LABOR_FILE: watch.file };
     delete env.PI_SESSION_FILE;
     delete env.PI_SESSION_ID;
     delete env.PI_ARTIFACTS_DIR;
+    // JSON events let the footer follow the run; the log gets a digest.
     const agent = spawn(
       HOST_CLI,
-      ["-p", "--no-session", watchMessage(watch.file, requests)],
+      [
+        "-p",
+        "--mode",
+        "json",
+        "--no-session",
+        watchMessage(watch.file, requests),
+      ],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
-    watch.agent = agent;
-    agent.stdout.pipe(log, { end: false });
+    const run: AgentRun = {
+      process: agent,
+      requests: requests.length,
+      replied: 0,
+      activity: "starting",
+      calls: new Map(),
+      apiError: null,
+    };
+    watch.run = run;
+    watch.failed = false;
+    createInterface({ input: agent.stdout }).on("line", (line) => {
+      if (followAgentLine(run, line, write) && watch.run === run) {
+        showWatchStatus(watch);
+      }
+    });
     agent.stderr.pipe(log, { end: false });
     let finished = false;
     // "error" (it couldn't start) can be followed by "close"; handle one.
@@ -1426,11 +1652,12 @@ export default function (pi: ExtensionAPI) {
       finished = true;
       log.end();
       // Stopped with the watch, which killed it.
-      if (annotationWatch !== watch || watch.agent !== agent) return;
-      watch.agent = null;
+      if (annotationWatch !== watch || watch.run !== run) return;
+      watch.run = null;
+      watch.failed = failure !== null;
       const message = failure
-        ? `The annotation agent stopped on ${count} in "${watch.file}" (${failure}). Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
-        : `The annotation agent handled ${count} in "${watch.file}".`;
+        ? `The annotation agent stopped in "${watch.file}" with ${run.replied} of ${count} replied: ${run.apiError ?? failure}. Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
+        : `The annotation agent replied on ${run.replied} of ${count} in "${watch.file}".`;
       watchUi(watch, (ui) => ui.notify(message, failure ? "error" : "info"));
       showWatchStatus(watch);
       runAnnotationAgent(watch);
@@ -1446,7 +1673,7 @@ export default function (pi: ExtensionAPI) {
   async function pollAnnotationWatch(
     watch: AnnotationWatch,
     ensureCategory: boolean,
-  ): Promise<{ sent: number; createdCategory: boolean }> {
+  ): Promise<{ createdCategory: boolean }> {
     const { result } = await bridgeCommand(
       "run_script",
       {
@@ -1491,7 +1718,7 @@ export default function (pi: ExtensionAPI) {
       watch.queue.push(...fresh);
       runAnnotationAgent(watch);
     }
-    return { sent: fresh.length, createdCategory };
+    return { createdCategory };
   }
 
   /** Stop the watch, if any, and return the file it watched. */
@@ -1500,8 +1727,8 @@ export default function (pi: ExtensionAPI) {
     if (!watch) return null;
     annotationWatch = null;
     clearInterval(watch.timer);
-    watch.agent?.kill("SIGTERM");
-    watch.agent = null;
+    watch.run?.process.kill("SIGTERM");
+    watch.run = null;
     watchUi(watch, (ui) => ui.setStatus("labor-watch", undefined));
     return watch.file;
   }
@@ -1754,11 +1981,12 @@ export default function (pi: ExtensionAPI) {
         sent: new Set(),
         warned: new Set(),
         queue: [],
-        agent: null,
+        run: null,
+        failed: false,
         polling: true,
       };
       annotationWatch = watch;
-      let first: { sent: number; createdCategory: boolean };
+      let first: { createdCategory: boolean };
       try {
         first = await pollAnnotationWatch(watch, true);
       } catch (err) {
@@ -1790,11 +2018,8 @@ export default function (pi: ExtensionAPI) {
       const created = first.createdCategory
         ? ` Added the "${AGENT_CATEGORY}" annotation category to the file.`
         : "";
-      const sent = first.sent
-        ? ` Handed ${first.sent} pending request${first.sent === 1 ? "" : "s"} to a background agent.`
-        : " No pending requests yet.";
       ctx.ui.notify(
-        `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created}${sent}`,
+        `Watching "${watch.file}" for "${AGENT_CATEGORY}" annotations.${created}`,
         "success",
       );
     },
@@ -1965,6 +2190,29 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, signal) {
       return runTool("get_children", { nodeId: params.nodeId }, { signal });
+    },
+  });
+
+  pi.registerTool({
+    name: "labor_export_node",
+    label: "Export Node",
+    description: `Export a node as a PNG and return it as an image you can look at, e.g. to check a change when MCP get_screenshot isn't available. The longest side is capped at ${EXPORT_MAX_SIDE}px. Use this instead of exportAsync in labor_run_script: image bytes copied through text get corrupted.`,
+    parameters: Type.Object({
+      nodeId: Type.String({ description: "Node ID, e.g. '123:456'" }),
+      scale: Type.Optional(
+        Type.Number({
+          exclusiveMinimum: 0,
+          maximum: 4,
+          description: "Export scale. Default 1",
+        }),
+      ),
+    }),
+    async execute(_id, params, signal) {
+      return runTool(
+        "run_script",
+        { code: exportScript(params.nodeId, params.scale ?? 1) },
+        { timeout: 60_000, signal, content: exportContent },
+      );
     },
   });
 

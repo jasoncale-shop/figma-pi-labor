@@ -61,7 +61,12 @@ labor ◌ M     MCP working (Figma is open and MCP is enabled)
 labor P M     plugin is running and MCP is working
 labor P2 M    plugin is open in 2 files
 watching "x"  /figma-labor-watch is on for file "x"
-watching "x" · agent working  its background agent is handling requests
+watching "x" · agent 1/2 replied · <step>
+              its background agent replied on 1 of 2 requests so far; <step> is what it's doing now
+watching "x" · … · 1 queued
+              a request is waiting for the next run
+watching "x" · last run failed
+              the last run ended in an error; its notification says why
 ```
 
 ### Multiple files
@@ -89,7 +94,7 @@ Annotate frames, components, instances, shapes, or text, not groups: Figma gives
 
 Copies keep their source's annotations, but not its requests: `labor_clone_node` drops the **Agent** annotations a clone copied, and while the watch runs, so does duplicating, pasting, or cloning by any means, as long as the original is still in the file. A cut-and-paste keeps its request, and other categories are always kept.
 
-`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p` or `pi -p`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: the footer shows `· agent working` during a run, and a notification reports each run's end. One run goes at a time, and requests that arrive meanwhile wait for the next. Output goes to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
+`/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, hands pending requests to a background agent right away, then hands over each new or edited one within a few seconds. The background agent is a headless run of the same CLI (`omp -p --mode json` or `pi -p --mode json`, no saved session) that loads this extension with `FIGMA_LABOR_FILE` set to the watched file, so its Labor tools target that file from the start. It replies on the annotations, and nothing lands in your conversation: during a run the footer follows its events, showing how many requests it has replied on and its current step, and a notification reports each run's end with the reply count, or the API error that stopped it. One run goes at a time, and requests that arrive meanwhile wait for the next. Each run's steps, replies, and errors go to `figma-labor-watch.log` in the system temp directory, and a failed run's notification points there. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`, which also stops a running agent. Switching the session to another file with `labor_use_file` stops it too.
 
 ## MCP ↔ Labor
 
@@ -97,7 +102,7 @@ MCP tools are preferred for reading. If MCP is unavailable, Labor will use Figma
 
 | MCP tool             | labor equivalent                                                  |
 | -------------------- | ----------------------------------------------------------------- |
-| `get_screenshot`     | `labor_zoom_to_node` + manual inspect                             |
+| `get_screenshot`     | `labor_export_node`                                               |
 | `get_design_context` | `labor_get_node_full` + `labor_get_children` + `labor_run_script` |
 | `get_metadata`       | `labor_get_children` + `labor_run_script`                         |
 | `get_variable_defs`  | `labor_run_script`                                                |
@@ -128,6 +133,7 @@ MCP tools are preferred for reading. If MCP is unavailable, Labor will use Figma
 | `labor_move_node`                 | Move a node to a different parent                              |
 | `labor_select_node`               | Select a node and zoom to it                                   |
 | `labor_zoom_to_node`              | Zoom the viewport to a node without selecting it               |
+| `labor_export_node`               | Export a node as a PNG image the agent can look at             |
 | `labor_detach_instance`           | Detach a component instance into a plain frame                 |
 | `labor_run_script`                | Run arbitrary JavaScript in the Figma plugin context           |
 | `labor_get_annotations`           | List annotations on the page, selection, a node, or document   |

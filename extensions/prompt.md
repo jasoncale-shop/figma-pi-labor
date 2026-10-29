@@ -32,7 +32,7 @@ Use `figma-select` for search and inspection in every editor. Read the matching 
 
 | MCP tool               | labor equivalent                                                  |
 | ---------------------- | ----------------------------------------------------------------- |
-| `get_screenshot`       | `labor_zoom_to_node` + manual inspect                             |
+| `get_screenshot`       | `labor_export_node`                                               |
 | `get_design_context`   | `labor_get_node_full` + `labor_get_children` + `labor_run_script` |
 | `get_metadata`         | `labor_get_children` + `labor_run_script`                         |
 | `get_variable_defs`    | `labor_run_script`                                                |
@@ -90,6 +90,7 @@ Re-read affected nodes when layout or visibility matters. Do not report success 
 - Return the smallest plain-JSON value that answers the question: ids, names, and the fields you need. No whole-tree dumps; cap long lists (`.slice(0, 50)`) and return the total count
 - `fontName`, `fontSize`, `lineHeight`, `letterSpacing`, `fills` on text, and `cornerRadius` can be `figma.mixed`, a Symbol that cannot be returned ("Cannot unwrap symbol"). Coerce with `v === figma.mixed ? "mixed" : v`, or read per range (`getRangeFontName`, `getRangeFontSize`) or per corner (`topLeftRadius`, …)
 - Never return nodes, paints holding image bytes, or other plugin objects; map them to plain fields
+- To look at a node, call `labor_export_node`, which returns the image itself. Never export from a script or copy base64 through code you write: image bytes copied through text get corrupted, and the model API rejects the broken image
 
 ## Annotations
 
