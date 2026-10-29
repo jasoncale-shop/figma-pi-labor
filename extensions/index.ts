@@ -1390,13 +1390,16 @@ export default function (pi: ExtensionAPI) {
       requests.length === 1 ? "1 request" : `${requests.length} requests`;
     const log = createWriteStream(WATCH_LOG, { flags: "a" });
     log.write(`\n== ${new Date().toISOString()} "${watch.file}", ${count}\n`);
+    // omp gives its shells and kernels the session's file and artifacts dir;
+    // the agent runs without a session, so it mustn't inherit them.
+    const env = { ...process.env, FIGMA_LABOR_FILE: watch.file };
+    delete env.PI_SESSION_FILE;
+    delete env.PI_SESSION_ID;
+    delete env.PI_ARTIFACTS_DIR;
     const agent = spawn(
       HOST_CLI,
       ["-p", "--no-session", watchMessage(watch.file, requests)],
-      {
-        env: { ...process.env, FIGMA_LABOR_FILE: watch.file },
-        stdio: ["ignore", "pipe", "pipe"],
-      },
+      { env, stdio: ["ignore", "pipe", "pipe"] },
     );
     watch.agent = agent;
     agent.stdout.pipe(log, { end: false });
