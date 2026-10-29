@@ -77,12 +77,14 @@ Open _Pi Labor_ in several files and run one agent per file. The bridge keeps a 
 
 The Plugin API can't read comments, but it can read and write annotations, so annotations are how a designer asks the agent for changes from inside Figma:
 
-1. Annotate a layer and put the annotation in the **Agent** category, e.g. "make this red"
+1. Annotate a layer and put the annotation in the **Agent** category, e.g. "make this red". Or start the text with `agent:` in any category, e.g. "agent: make this red"; the agent files it under **Agent** and drops the prefix
 2. Ask pi to work through the annotations, or run `/figma-labor-watch` to have new ones sent to the agent as they appear
-3. The agent makes each change, then replies on the annotation with a paragraph such as `🤖 Done: filled Frame 1 with red` or `🤖 Question: which red?`
+3. The agent makes each change, then replies on the annotation with a paragraph such as `■ Done: filled Frame 1 with red` or `■ Question: which red?`
 4. Delete the annotation when you're happy. To follow up, add a paragraph under the reply; that makes the request pending again
 
-A request counts as pending until its last paragraph is a 🤖 reply. Other categories (Development, Content, …) stay specs: the agent reads them for context but doesn't act on them.
+A request counts as pending until its last paragraph is a ■ reply. Other categories (Development, Content, …) stay specs: the agent reads them for context but doesn't act on them.
+
+Copies keep their source's annotations, but not its requests: `labor_clone_node` drops the **Agent** annotations a clone copied, and while the watch runs, so does duplicating, pasting, or cloning by any means, as long as the original is still in the file. A cut-and-paste keeps its request, and other categories are always kept.
 
 `/figma-labor-watch` watches one file: this session's target, the file you name, or the only connected one. It adds the **Agent** category if the file lacks it, sends pending requests right away, then sends each new or edited one within a few seconds. An idle agent starts on them at once; a busy one gets them after its current turn. Annotations don't record who wrote them, so while the watch is on, anyone who can edit the file can direct the agent; turn it off with `/figma-labor-watch off`. Switching the session to another file with `labor_use_file` stops it.
 

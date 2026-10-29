@@ -315,6 +315,8 @@ interface BridgeToolOptions {
   target?: string | null;
   /** Called with the file that ran the command. */
   onFile?: (file: BridgeFile) => void;
+  /** Amends a successful result before it's shown. Must not throw. */
+  after?: (result: unknown, file: BridgeFile | null) => Promise<unknown>;
 }
 
 async function runBridgeTool(
@@ -376,14 +378,15 @@ async function runBridgeTool(
         isError: true,
       };
     }
+    const amended = opts?.after ? await opts.after(result, file) : result;
     const output = opts?.includeContext
       ? {
           file: file?.file ?? null,
           editorType: file?.editorType ?? status.context?.editorType ?? null,
           page: file?.page ?? status.context?.page ?? null,
-          selection: result,
+          selection: amended,
         }
-      : result;
+      : amended;
     return {
       content: [{ type: "text" as const, text: formatToolOutput(output) }],
     };
@@ -404,7 +407,7 @@ async function runBridgeTool(
 /** Annotations in this category are requests for the agent. */
 const AGENT_CATEGORY = "Agent";
 /** Starts the agent's reply paragraph inside an annotation. */
-const AGENT_REPLY_MARK = "🤖";
+const AGENT_REPLY_MARK = "■";
 
 const ANNOTATION_PROPERTY_TYPES = [
   "width",
@@ -466,6 +469,28 @@ function isPending(a) {
   const paragraphs = labelOf(a).split(/\\n+/).map((p) => p.trim()).filter(Boolean);
   return paragraphs.length > 0 && !paragraphs[paragraphs.length - 1].startsWith(REPLY_MARK);
 }
+// "agent: …" opening an annotation in any category, or none, is a request
+// too. The watch, or the agent's reply, files it under Agent without the prefix.
+const AGENT_PREFIX = /^\\s*agent\\s*:\\s*(?=\\S)/i;
+const hasAgentPrefix = (a) => AGENT_PREFIX.test(labelOf(a));
+const isRequest = (a) => isAgentCategory(a.categoryId) || hasAgentPrefix(a);
+// A plain copy to write back. Figma rejects annotations that set both label
+// and labelMarkdown, which is how it reports them, so copy one of the two.
+function copyAnnotation(a) {
+  const copy = {};
+  if (a.labelMarkdown) copy.labelMarkdown = a.labelMarkdown;
+  else if (a.label) copy.label = a.label;
+  if (a.properties?.length) copy.properties = a.properties.map((p) => ({ type: p.type }));
+  if (a.categoryId) copy.categoryId = a.categoryId;
+  return copy;
+}
+// File an "agent:" request, given as a copy, under Agent without the prefix.
+function categorize(copy, agentId) {
+  copy.labelMarkdown = labelOf(copy).replace(AGENT_PREFIX, "");
+  delete copy.label;
+  copy.categoryId = agentId;
+  return copy;
+}
 function describeAnnotation(a, index) {
   const out = { index };
   const label = labelOf(a);
@@ -474,8 +499,8 @@ function describeAnnotation(a, index) {
     const name = categoryLabel(a.categoryId);
     if (name) out.category = name;
     else out.categoryId = a.categoryId;
-    if (isAgentCategory(a.categoryId)) out.status = isPending(a) ? "pending" : "replied";
   }
+  if (isRequest(a)) out.status = isPending(a) ? "pending" : "replied";
   if (a.properties?.length) out.properties = a.properties.map((p) => p.type);
   return out;
 }
@@ -498,6 +523,18 @@ async function nodeById(id) {
   }
 }
 const hasAnnotations = (n) => "annotations" in n && n.annotations.length > 0;
+// The node and its descendants that have annotations.
+const annotatedIn = (node) => [
+  ...(hasAnnotations(node) ? [node] : []),
+  ...("findAll" in node ? node.findAll(hasAnnotations) : []),
+];
+// Rewrite node.annotations without the ones drop picks; returns how many went.
+function dropAnnotations(node, drop) {
+  const kept = node.annotations.filter((a) => !drop(a));
+  const dropped = node.annotations.length - kept.length;
+  if (dropped) node.annotations = kept.map(copyAnnotation);
+  return dropped;
+}
 `;
 
 function annotationScript(body: string, args: Record<string, unknown>): string {
@@ -506,13 +543,16 @@ function annotationScript(body: string, args: Record<string, unknown>): string {
 
 const GET_ANNOTATIONS_SCRIPT = `
 const wanted = args.category?.trim().toLowerCase();
-const matches = (a) => !wanted || a.categoryId === args.category || categoryLabel(a.categoryId)?.trim().toLowerCase() === wanted;
+// "agent:" requests count as Agent whatever their category.
+const wantsAgent = wanted === AGENT.toLowerCase() || isAgentCategory(args.category);
+const matches = (a) =>
+  !wanted ||
+  a.categoryId === args.category ||
+  categoryLabel(a.categoryId)?.trim().toLowerCase() === wanted ||
+  (wantsAgent && hasAgentPrefix(a));
 let scope;
 let nodes = [];
-const collect = (root) => {
-  if (hasAnnotations(root)) nodes.push(root);
-  if ("findAll" in root) nodes.push(...root.findAll(hasAnnotations));
-};
+const collect = (root) => nodes.push(...annotatedIn(root));
 if (args.nodeId) {
   const root = await nodeById(args.nodeId);
   if (!root) return { error: "Node " + args.nodeId + " not found." };
@@ -559,16 +599,7 @@ const UPDATE_ANNOTATIONS_SCRIPT = `
 const node = await nodeById(args.nodeId);
 if (!node) return { error: "Node " + args.nodeId + " not found." };
 if (!("annotations" in node)) return { error: node.type + " nodes can't have annotations." };
-// Figma rejects annotations that set both label and labelMarkdown, which is
-// how it reports them, so copy one of the two.
-const list = node.annotations.map((a) => {
-  const copy = {};
-  if (a.labelMarkdown) copy.labelMarkdown = a.labelMarkdown;
-  else if (a.label) copy.label = a.label;
-  if (a.properties?.length) copy.properties = a.properties.map((p) => ({ type: p.type }));
-  if (a.categoryId) copy.categoryId = a.categoryId;
-  return copy;
-});
+const list = node.annotations.map(copyAnnotation);
 const index = args.index;
 if (args.action !== "add" && (index === undefined || !list[index])) {
   return { error: "Annotation index " + index + " is out of range; the node has " + list.length + " annotation(s)." };
@@ -613,6 +644,11 @@ if (args.action === "add") {
   const text = args.label?.trim().replace(/\\s*\\n+\\s*/g, " ");
   if (!text) return { error: "reply needs a label: the reply text." };
   const a = list[index];
+  if (hasAgentPrefix(a)) {
+    const ensured = await ensureAgentCategory();
+    if (ensured.created) createdCategory = true;
+    categorize(a, ensured.category.id);
+  }
   const previous = a.labelMarkdown ?? a.label ?? "";
   delete a.label;
   a.labelMarkdown = (previous ? previous + "\\n\\n" : "") + REPLY_MARK + " " + text;
@@ -628,42 +664,86 @@ return result;
 // One listener per plugin instance records nodes whose annotations change,
 // keeping at most 1000; each poll reads the ones changed since its last poll.
 // A watcher's first poll, and any poll after the plugin restarted, scans the
-// whole document instead.
+// whole document instead. The listener carries a version so a newer extension
+// replaces the one an older one installed.
 const WATCH_ANNOTATIONS_SCRIPT = `
-const createdCategory = args.ensureCategory ? (await ensureAgentCategory()).created : false;
+let createdCategory = args.ensureCategory ? (await ensureAgentCategory()).created : false;
 let state = globalThis.__laborAnnotationWatch;
 let full = args.since === null;
-if (!state) {
+if (state?.version !== 2) {
+  if (state?.listener) figma.off("documentchange", state.listener);
   await figma.loadAllPagesAsync();
   const changed = new Map();
-  figma.on("documentchange", (event) => {
+  const listener = (event) => {
     const at = Date.now();
     for (const change of event.documentChanges) {
       if (change.type === "DELETE") {
         changed.delete(change.id);
         continue;
       }
-      const annotated =
-        change.type === "PROPERTY_CHANGE"
-          ? change.properties.includes("annotations")
-          : change.type === "CREATE" && hasAnnotations(change.node);
+      // A copy (duplicate, paste, clone) is one CREATE for its root, with
+      // annotations anywhere in its subtree.
+      const created = change.type === "CREATE";
+      const annotated = created
+        ? annotatedIn(change.node).length > 0
+        : change.type === "PROPERTY_CHANGE" && change.properties.includes("annotations");
       if (!annotated) continue;
+      const prior = changed.get(change.id);
       changed.delete(change.id);
-      changed.set(change.id, { node: change.node, at });
+      changed.set(change.id, { node: change.node, at, created: created || Boolean(prior?.created) });
       if (changed.size > 1000) changed.delete(changed.keys().next().value);
     }
-  });
-  state = globalThis.__laborAnnotationWatch = { changed };
+  };
+  figma.on("documentchange", listener);
+  state = globalThis.__laborAnnotationWatch = { version: 2, listener, changed };
   full = true;
 }
 const now = Date.now();
 for (const [id, entry] of state.changed) if (now - entry.at > 600000) state.changed.delete(id);
-const nodes = full
-  ? figma.root.findAll(hasAnnotations)
-  : [...state.changed.values()].filter((entry) => entry.at >= args.since && !entry.node.removed).map((entry) => entry.node);
+let nodes = [];
+const copies = [];
+if (full) {
+  nodes = figma.root.findAll(hasAnnotations);
+} else {
+  for (const entry of state.changed.values()) {
+    if (entry.at < args.since || entry.node.removed) continue;
+    if (!entry.created) {
+      nodes.push(entry.node);
+      continue;
+    }
+    entry.created = false;
+    const annotated = annotatedIn(entry.node);
+    nodes.push(...annotated);
+    copies.push(...annotated);
+  }
+}
+// A copy keeps its source's annotations. Drop the Agent requests whose source
+// is still in the file: the copy shouldn't repeat them, but a cut-and-paste
+// or an undone delete keeps its request. Other annotations stay.
+const copiedRequests = copies.filter((node) => node.annotations.some(isRequest));
+if (copiedRequests.length) {
+  const copyIds = new Set(copies.map((node) => node.id));
+  const sources = new Set();
+  for (const node of figma.root.findAll(hasAnnotations)) {
+    if (copyIds.has(node.id)) continue;
+    for (const a of node.annotations) if (isRequest(a)) sources.add(labelOf(a));
+  }
+  for (const node of copiedRequests) dropAnnotations(node, (a) => isRequest(a) && sources.has(labelOf(a)));
+}
+let agentId = null;
+const seen = new Set();
 const requests = [];
 for (const node of nodes) {
-  if (!("annotations" in node)) continue;
+  if (seen.has(node.id) || node.removed || !("annotations" in node)) continue;
+  seen.add(node.id);
+  if (node.annotations.some(hasAgentPrefix)) {
+    if (!agentId) {
+      const ensured = await ensureAgentCategory();
+      agentId = ensured.category.id;
+      if (ensured.created) createdCategory = true;
+    }
+    node.annotations = node.annotations.map((a) => (hasAgentPrefix(a) ? categorize(copyAnnotation(a), agentId) : copyAnnotation(a)));
+  }
   node.annotations.forEach((a, index) => {
     if (isAgentCategory(a.categoryId) && isPending(a)) {
       requests.push({ nodeId: node.id, name: node.name, index, label: labelOf(a), page: pageOf(node)?.name });
@@ -672,6 +752,53 @@ for (const node of nodes) {
 }
 return { since: now, requests, createdCategory };
 `;
+
+// labor_clone_node: a clone keeps its source's annotations. Drop the Agent
+// requests among them; other annotations stay.
+const DROP_COPIED_REQUESTS_SCRIPT = `
+const node = await nodeById(args.nodeId);
+if (!node) return { error: "Node " + args.nodeId + " not found." };
+let dropped = 0;
+for (const n of annotatedIn(node)) dropped += dropAnnotations(n, isRequest);
+return { dropped };
+`;
+
+/** Drop the Agent requests a clone copied so they don't reach the agent again. */
+async function dropCopiedRequests(
+  clone: unknown,
+  file: BridgeFile | null,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const id = (clone as { id?: unknown } | null)?.id;
+  // Only Figma Design and Dev Mode have annotations.
+  const editor = file?.editorType;
+  if (
+    typeof id !== "string" ||
+    (file && editor !== "figma" && editor !== "dev")
+  )
+    return clone;
+  try {
+    const { result } = await bridgeCommand(
+      "run_script",
+      { code: annotationScript(DROP_COPIED_REQUESTS_SCRIPT, { nodeId: id }) },
+      { target: file?.id ?? null, signal },
+    );
+    const { dropped, error } = (result ?? {}) as {
+      dropped?: number;
+      error?: string;
+    };
+    if (error) throw new Error(error);
+    return dropped
+      ? { ...(clone as object), droppedAgentRequests: dropped }
+      : clone;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ...(clone as object),
+      warning: `Couldn't drop the Agent requests copied onto the clone: ${msg}`,
+    };
+  }
+}
 
 interface AnnotationRequest {
   nodeId: string;
@@ -1758,7 +1885,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "labor_get_annotations",
     label: "Get Annotations",
-    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes.`,
+    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category, or whose text starts with "agent:", are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes.`,
     parameters: Type.Object({
       nodeId: Type.Optional(
         Type.String({ description: "Search this node and its descendants" }),
@@ -1794,7 +1921,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "labor_update_annotations",
     label: "Update Annotations",
-    description: `Add, update, remove, or reply to one annotation on a node, leaving its other annotations as they are. "reply" appends a ${AGENT_REPLY_MARK} paragraph to an existing annotation: use it to answer "${AGENT_CATEGORY}" requests. Use this tool instead of assigning node.annotations in a script, which replaces every annotation on the node.`,
+    description: `Add, update, remove, or reply to one annotation on a node, leaving its other annotations as they are. "reply" appends a ${AGENT_REPLY_MARK} paragraph to an existing annotation: use it to answer "${AGENT_CATEGORY}" requests; replying to an "agent:" request also files it under "${AGENT_CATEGORY}" and drops the prefix. Use this tool instead of assigning node.annotations in a script, which replaces every annotation on the node.`,
     parameters: Type.Object({
       nodeId: Type.String({ description: "Node ID" }),
       action: StringEnum(["add", "update", "remove", "reply"] as const),
@@ -2038,8 +2165,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "labor_clone_node",
     label: "Clone Node",
-    description:
-      "Clone a node. Optionally rename it, move it to another parent, and position it.",
+    description: `Clone a node. Optionally rename it, move it to another parent, and position it. "${AGENT_CATEGORY}" requests copied onto the clone are dropped; other annotations stay.`,
     parameters: Type.Object({
       nodeId: Type.String({ description: "Node ID to clone" }),
       parentId: Type.Optional(
@@ -2052,7 +2178,10 @@ export default function (pi: ExtensionAPI) {
       y: Type.Optional(Type.Number({ description: "Y position" })),
     }),
     async execute(_id, params, signal) {
-      return runTool("clone_node", params, { signal });
+      return runTool("clone_node", params, {
+        signal,
+        after: (clone, file) => dropCopiedRequests(clone, file, signal),
+      });
     },
   });
 
