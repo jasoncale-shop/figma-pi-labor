@@ -68,15 +68,33 @@ const BRIDGE_URL = "http://127.0.0.1:3846";
 const BRIDGE_BIN = join(__dirname, "bridge.js");
 const MCP_URL = `http://127.0.0.1:${process.env.FIGMA_MCP_PORT ?? "3845"}/mcp`;
 const MAX_OUTPUT_BYTES = 50 * 1024;
-/** The CLI running this extension; the annotation watch starts its agent with it. */
+/** The CLI running this extension; the annotation watch starts its agents with it. */
 const HOST_CLI = process.argv[1]?.includes("@oh-my-pi/") ? "omp" : "pi";
+/**
+ * Flags for the watch's agents. omp's `auto` thinking has a classifier size
+ * the reasoning effort to the requests, up to the user's configured ceiling:
+ * low for a color change, more for a new screen. The config file turns off
+ * what slows a background run without helping it. pi has neither, so its
+ * agents run on the user's settings.
+ */
+const WATCH_AGENT_ARGS =
+  HOST_CLI === "omp"
+    ? ["--thinking", "auto", "--config", join(__dirname, "watch-agent.yml")]
+    : [];
 /** Output of the annotation watch's background agent runs. */
 const WATCH_LOG = join(tmpdir(), "figma-labor-watch.log");
+/** How often the watch reads its file's annotation changes. */
+const WATCH_POLL_MS = 1_000;
+/**
+ * Most background agents the watch runs at once. Each works in different
+ * top-level frames, so a small request needn't wait out a long one elsewhere.
+ */
+const MAX_WATCH_AGENTS = 3;
 /**
  * How long the watch lets its agent's process exit on its own once the agent
- * is done. omp's advisor reviews a finished run while its process waits, for
- * up to 10 minutes; nothing it says then reaches Figma, so the watch ends the
- * process instead of holding the next requests behind it.
+ * is done. Background work, such as omp's advisor reviewing a finished run,
+ * can keep it alive for minutes; nothing done then reaches Figma, so the
+ * watch ends the process instead of holding the requests queued behind it.
  */
 const AGENT_END_GRACE_MS = 3_000;
 /** How often the watch redraws its footer and details. */
@@ -323,9 +341,17 @@ async function waitForPlugin(
 
 // ## TOOL HELPERS
 
+// Compact: indentation would add about a third to the tokens of every result.
 function formatToolOutput(output: unknown): string {
-  return JSON.stringify(output, null, 2) ?? "No result returned by Figma.";
+  return JSON.stringify(output) ?? "No result returned by Figma.";
 }
+
+/**
+ * omp mounts extension tools as xd:// devices whose docs the agent reads
+ * before its first call to each, a model round trip apiece. The tools most
+ * jobs use stay top-level instead. pi lists every tool and ignores the field.
+ */
+const TOP_LEVEL_TOOL = { loadMode: "essential" } as const;
 
 type ToolContent =
   | { type: "text"; text: string }
@@ -578,6 +604,51 @@ function pathOf(node) {
   if (names.length <= 2) return names.reverse().join(" › ");
   return names[names.length - 1] + " › … › " + names[0];
 }
+// The node's ancestor at the top of its page, or the node itself.
+function topOf(node) {
+  let n = node;
+  while (n.parent && n.parent.type !== "PAGE") n = n.parent;
+  return n;
+}
+const hexOf = (c) => "#" + [c.r, c.g, c.b].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("").toUpperCase();
+function paintsOf(paints) {
+  if (paints === figma.mixed) return "mixed";
+  const shown = paints.filter((p) => p.visible !== false);
+  if (!shown.length) return null;
+  return shown.map((p) => {
+    if (p.type !== "SOLID") return p.type.toLowerCase().replace("_", " ");
+    const opacity = p.opacity !== undefined && p.opacity < 1 ? " " + Math.round(p.opacity * 100) + "%" : "";
+    return hexOf(p.color) + opacity + (p.boundVariables?.color ? " (variable)" : "");
+  }).join(", ");
+}
+// One line about a requested node, often enough to act on a small request
+// without inspecting it first.
+async function summaryOf(node) {
+  const parts = [node.type + ("width" in node ? " " + Math.round(node.width) + "×" + Math.round(node.height) : "")];
+  if (node.type === "TEXT") {
+    const text = node.characters;
+    parts.push(JSON.stringify(text.length > 60 ? text.slice(0, 59) + "…" : text));
+    const font = node.fontName === figma.mixed ? "mixed fonts" : node.fontName.family + " " + node.fontName.style;
+    parts.push(font + " " + (node.fontSize === figma.mixed ? "mixed sizes" : node.fontSize));
+  }
+  if (node.type === "INSTANCE") {
+    const main = await node.getMainComponentAsync().catch(() => null);
+    if (main) parts.push('instance of "' + (main.parent?.type === "COMPONENT_SET" ? main.parent.name + " / " : "") + main.name + '"');
+  }
+  if ("fills" in node) parts.push("fill " + (paintsOf(node.fills) ?? "none"));
+  if ("strokes" in node) {
+    const strokes = paintsOf(node.strokes);
+    if (strokes) parts.push("stroke " + strokes + (typeof node.strokeWeight === "number" ? " " + node.strokeWeight + "px" : ""));
+  }
+  if ("cornerRadius" in node && node.cornerRadius !== 0) parts.push("radius " + (node.cornerRadius === figma.mixed ? "mixed" : node.cornerRadius));
+  if ("layoutMode" in node && node.layoutMode !== "NONE") {
+    const padding = [node.paddingTop, node.paddingRight, node.paddingBottom, node.paddingLeft].join("/");
+    parts.push("auto-layout " + node.layoutMode.toLowerCase() + ", gap " + node.itemSpacing + ", padding " + padding);
+  }
+  if ("opacity" in node && node.opacity < 1) parts.push("opacity " + Math.round(node.opacity * 100) + "%");
+  if ("children" in node) parts.push(node.children.length + (node.children.length === 1 ? " child" : " children"));
+  return parts.join(", ");
+}
 async function nodeById(id) {
   try {
     return await figma.getNodeByIdAsync(id);
@@ -650,6 +721,7 @@ for (const node of nodes) {
   const path = pathOf(node);
   if (path) entry.path = path;
   if (scope === "document") entry.page = pageOf(node)?.name;
+  if (annotations.some((a) => a.status === "pending")) entry.summary = await summaryOf(node);
   entry.annotations = annotations;
   shown.push(entry);
 }
@@ -815,11 +887,10 @@ for (const node of nodes) {
     }
     node.annotations = node.annotations.map((a) => (hasAgentPrefix(a) ? categorize(copyAnnotation(a), agentId) : copyAnnotation(a)));
   }
-  node.annotations.forEach((a, index) => {
-    if (isAgentCategory(a.categoryId) && isPending(a)) {
-      requests.push({ nodeId: node.id, name: node.name, index, label: labelOf(a), page: pageOf(node)?.name });
-    }
-  });
+  const pending = node.annotations.flatMap((a, index) => (isAgentCategory(a.categoryId) && isPending(a) ? [{ index, label: labelOf(a) }] : []));
+  if (!pending.length) continue;
+  const where = { nodeId: node.id, name: node.name, page: pageOf(node)?.name, path: pathOf(node) || undefined, top: topOf(node).id, summary: await summaryOf(node) };
+  for (const request of pending) requests.push({ ...where, ...request });
 }
 if (unreadable.length) {
   const names = unreadable.map((n) => '"' + n.name + '"').join(", ");
@@ -881,19 +952,27 @@ interface AnnotationRequest {
   index: number;
   label: string;
   page?: string;
+  /** Where the node sits on its page, as pathOf in the scripts gives it. */
+  path?: string;
+  /** Id of the node's top-level ancestor on its page; one agent works in each at a time. */
+  top: string;
+  /** The node's type, size, fills, layout, and text, as summaryOf gives them. */
+  summary: string;
 }
 
 function watchMessage(file: string, requests: AnnotationRequest[]): string {
-  const lines = requests.map(
-    (r) =>
-      `- node ${r.nodeId} "${r.name}"${r.page ? ` on page "${r.page}"` : ""}, annotation ${r.index}:\n  ${r.label.replace(/\n+/g, "\n  ")}`,
-  );
+  const lines = requests.map((r) => {
+    const path = r.path ? ` in "${r.path}"` : "";
+    const page = r.page ? ` on page "${r.page}"` : "";
+    return `- node ${r.nodeId} "${r.name}"${path}${page}, annotation ${r.index} (${r.summary}):\n  ${r.label.replace(/\n+/g, "\n  ")}`;
+  });
   const count =
     requests.length === 1 ? "1 new request" : `${requests.length} new requests`;
   return [
-    `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}". Labor tools already target that file. You run in the background, so your replies on the annotations are the only report the designer sees.`,
+    `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}", each with its annotation's full text and a summary of its node. Labor tools already target that file. You run in the background: the designer sees only your replies on the annotations, and your final message goes only to a log, so keep it to one line.`,
     ...lines,
-    `Handle each on its node and verify, then reply on that annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply.`,
+    `Size your effort to each request. A small edit to an existing node (a color, size, radius, spacing, text, or name) needs no skill and no labor_get_annotations call: in one labor_run_script, read what the summary lacks, make the change, and return the changed values as your check; then reply. For new UI, components, prototypes, or changes across a screen, read the matching skill first, build in steps, and check the result with labor_export_node.`,
+    `Reply on each request's annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply. Other background agents may be editing other frames of this file at the same time: revert a mistake of yours by changing it back, not with labor_undo, which undoes the file's latest change whoever made it.`,
   ].join("\n");
 }
 
@@ -947,6 +1026,8 @@ type AgentPhase =
 
 /** A background agent run, as the footer, its details, and the run-end notification report it. */
 interface AgentRun {
+  /** Counts up from 1 per watch; tags the run's lines in the shared log. */
+  number: number;
   process: ChildProcess;
   requests: RunRequest[];
   startedAt: number;
@@ -993,15 +1074,17 @@ interface AnnotationWatch {
   file: string;
   ctx: ExtensionContext;
   since: number | null;
-  /** nodeId + label of every request already handed to the agent. */
+  /** nodeId + label of every request already handed to an agent. */
   sent: Set<string>;
   /** Groups whose annotation changes the watch has said it can't read. */
   warned: Set<string>;
-  /** Requests waiting for the running agent to finish. */
+  /** Requests waiting for an agent: for a free one, or for the one working in their top-level frame. */
   queue: AnnotationRequest[];
-  /** The background agent's current run. */
-  run: AgentRun | null;
-  /** The run before it. */
+  /** Background agent runs going now, oldest first, at most MAX_WATCH_AGENTS. */
+  runs: AgentRun[];
+  /** How many runs the watch has started. */
+  started: number;
+  /** The run that ended last. */
   last: FinishedRun | null;
   timer?: ReturnType<typeof setInterval>;
   polling: boolean;
@@ -1291,7 +1374,7 @@ function runActivity(run: AgentRun, now: number): [string, string] {
   return ["thinking", since(run.phaseSince)];
 }
 
-/** The watch's footer: its file, and what its agent is doing or last did. */
+/** The watch's footer: its file, and what its agents are doing or last did. */
 function watchStatusLine(
   watch: AnnotationWatch,
   theme: WatchTheme,
@@ -1299,12 +1382,18 @@ function watchStatusLine(
 ): string {
   const sep = theme.fg("dim", " · ");
   const name = `watch "${watch.file}"`;
-  const { run, last } = watch;
+  const { runs, last } = watch;
+  // The newest run, on the request the designer most likely just made.
+  const run = runs.at(-1);
   if (run) {
     const [what, time] = runActivity(run, now);
-    const color = run.phase === "retrying" ? "warning" : "accent";
-    let status = `${theme.fg(color, spinnerFrame(now))} ${name}${sep}${repliedCount(run)}/${run.requests.length} replied${sep}`;
-    status += run.phase === "retrying" ? theme.fg("warning", what) : what;
+    const retrying = run.phase === "retrying";
+    const requests = runs.flatMap((r) => r.requests);
+    const replied = requests.filter((r) => r.reply !== undefined).length;
+    let status = `${theme.fg(retrying ? "warning" : "accent", spinnerFrame(now))} ${name}${sep}`;
+    if (runs.length > 1) status += `${runs.length} agents${sep}`;
+    status += `${replied}/${requests.length} replied${sep}`;
+    status += retrying ? theme.fg("warning", what) : what;
     if (time) status += ` ${theme.fg("dim", time)}`;
     if (watch.queue.length) {
       status += sep + theme.fg("dim", `${watch.queue.length} queued`);
@@ -1356,8 +1445,8 @@ function stepLine(step: AgentStep, theme: WatchTheme, now: number): string {
 
 /**
  * The watch's details: its requests with their replies, the agent's latest
- * steps and words, and the log. At most 10 lines, which pi and omp both cap
- * widgets at.
+ * steps and words, and the log; with several agents, each one's request and
+ * what it's doing. At most 10 lines, which pi and omp both cap widgets at.
  */
 function watchDetailLines(
   watch: AnnotationWatch,
@@ -1366,54 +1455,77 @@ function watchDetailLines(
   width: number,
 ): string[] {
   const sep = theme.fg("dim", " · ");
-  const { run, last } = watch;
-  const shown = run ?? last?.run;
+  const { runs, last } = watch;
   let head = `${theme.fg("accent", "Figma watch")} "${watch.file}"${sep}`;
-  if (run) {
-    head += `run ${formatDuration(now - run.startedAt)}`;
-  } else if (last) {
-    head += `idle${sep}last run ${formatAgo(now - last.endedAt)}, took ${formatDuration(last.endedAt - last.run.startedAt)}`;
-  } else {
-    head += `idle${sep}waiting for "${AGENT_CATEGORY}" annotations`;
-  }
-  if (shown) {
-    const steps = shown.steps.length;
-    head += `${sep}${repliedCount(shown)}/${shown.requests.length} replied${sep}${steps} ${steps === 1 ? "step" : "steps"}`;
-    if (shown.cost) head += `${sep}$${shown.cost.toFixed(2)}`;
-  }
-  const lines = [head];
-  if (!run && last?.failure) {
-    lines.push(`  ${theme.fg("error", `✗ ${last.failure}`)}`);
-  }
-  if (shown) {
-    const room = run ? 3 : 5;
-    for (const request of shown.requests.slice(0, room)) {
-      lines.push(requestLine(request, theme, Boolean(run)));
-    }
-    if (shown.requests.length > room) {
-      lines.push(theme.fg("dim", `  +${shown.requests.length - room} more`));
-    }
-  }
-  if (run) {
-    const inTool = run.phase === "tool";
-    for (const step of run.steps.slice(inTool ? -3 : -2)) {
-      lines.push(stepLine(step, theme, now));
-    }
-    if (!inTool) {
+  const lines: string[] = [];
+  if (runs.length > 1) {
+    const requests = runs.flatMap((run) => run.requests);
+    const replied = requests.filter((r) => r.reply !== undefined).length;
+    const cost = runs.reduce((sum, run) => sum + run.cost, 0);
+    head += `${runs.length} agents${sep}${replied}/${requests.length} replied`;
+    if (cost) head += `${sep}$${cost.toFixed(2)}`;
+    lines.push(head);
+    // An equal share of the 8 lines between the head and the log line.
+    const room = Math.floor(8 / runs.length);
+    for (const run of runs) {
       const [what, time] = runActivity(run, now);
       const color = run.phase === "retrying" ? "warning" : "accent";
       lines.push(
-        `  ${theme.fg(color, spinnerFrame(now))} ${what}${time ? ` ${theme.fg("dim", time)}` : ""}`,
+        `  ${theme.fg(color, spinnerFrame(now))} ${formatDuration(now - run.startedAt)}${sep}${repliedCount(run)}/${run.requests.length} replied${sep}${what}${time ? ` ${theme.fg("dim", time)}` : ""}`,
       );
+      for (const request of run.requests.slice(0, room - 1)) {
+        lines.push(`  ${requestLine(request, theme, true)}`);
+      }
     }
-  }
-  const said = shown ? collapse(shown.said) : "";
-  if (said) {
-    // While it streams in, the newest words; once written, the first.
-    const room = Math.max(10, width - 6);
-    const text =
-      shown?.saying && said.length > room ? `…${said.slice(1 - room)}` : said;
-    lines.push(`  ${theme.fg("dim", `› ${text}`)}`);
+  } else {
+    const run = runs[0];
+    const shown = run ?? last?.run;
+    if (run) {
+      head += `run ${formatDuration(now - run.startedAt)}`;
+    } else if (last) {
+      head += `idle${sep}last run ${formatAgo(now - last.endedAt)}, took ${formatDuration(last.endedAt - last.run.startedAt)}`;
+    } else {
+      head += `idle${sep}waiting for "${AGENT_CATEGORY}" annotations`;
+    }
+    if (shown) {
+      const steps = shown.steps.length;
+      head += `${sep}${repliedCount(shown)}/${shown.requests.length} replied${sep}${steps} ${steps === 1 ? "step" : "steps"}`;
+      if (shown.cost) head += `${sep}$${shown.cost.toFixed(2)}`;
+    }
+    lines.push(head);
+    if (!run && last?.failure) {
+      lines.push(`  ${theme.fg("error", `✗ ${last.failure}`)}`);
+    }
+    if (shown) {
+      const room = run ? 3 : 5;
+      for (const request of shown.requests.slice(0, room)) {
+        lines.push(requestLine(request, theme, Boolean(run)));
+      }
+      if (shown.requests.length > room) {
+        lines.push(theme.fg("dim", `  +${shown.requests.length - room} more`));
+      }
+    }
+    if (run) {
+      const inTool = run.phase === "tool";
+      for (const step of run.steps.slice(inTool ? -3 : -2)) {
+        lines.push(stepLine(step, theme, now));
+      }
+      if (!inTool) {
+        const [what, time] = runActivity(run, now);
+        const color = run.phase === "retrying" ? "warning" : "accent";
+        lines.push(
+          `  ${theme.fg(color, spinnerFrame(now))} ${what}${time ? ` ${theme.fg("dim", time)}` : ""}`,
+        );
+      }
+    }
+    const said = shown ? collapse(shown.said) : "";
+    if (said) {
+      // While it streams in, the newest words; once written, the first.
+      const room = Math.max(10, width - 6);
+      const text =
+        shown?.saying && said.length > room ? `…${said.slice(1 - room)}` : said;
+      lines.push(`  ${theme.fg("dim", `› ${text}`)}`);
+    }
   }
   const queued = watch.queue.length ? `${watch.queue.length} queued · ` : "";
   lines.push(`  ${theme.fg("dim", `${queued}log ${WATCH_LOG}`)}`);
@@ -1932,13 +2044,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Annotation watch: off until /figma-labor-watch turns it on for one file,
-  // this session's target. Polls that file and hands new Agent requests to a
-  // background agent: a headless run of this CLI, which loads this extension
-  // too, with FIGMA_LABOR_FILE set to the watched file. One run at a time;
-  // requests that arrive meanwhile wait for the next. The session only shows
-  // a footer status that follows the run, details under the editor while
-  // tool output is expanded, a notification when a run ends, and a warning
-  // when an annotation changes on a group, which plugins can't read.
+  // this session's target. Polls that file and hands new Agent requests to
+  // background agents: headless runs of this CLI, which load this extension
+  // too, with FIGMA_LABOR_FILE set to the watched file. Up to
+  // MAX_WATCH_AGENTS run at once, one per top-level frame; a request whose
+  // frame has an agent waits for it. The session only shows a footer status
+  // that follows the runs, details under the editor while tool output is
+  // expanded, a notification when a run ends, and a warning when an
+  // annotation changes on a group, which plugins can't read.
   let annotationWatch: AnnotationWatch | null = null;
 
   /** Update the watch's UI, ignoring a context gone stale with its session. */
@@ -2001,17 +2114,39 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  /** Start the background agent on the queued requests unless it's running. */
-  function runAnnotationAgent(watch: AnnotationWatch) {
-    if (watch.run || !watch.queue.length) return;
-    const requests = watch.queue.splice(0);
+  /**
+   * Hand the queued requests that are ready to a new agent if there's room.
+   * One agent works in a top-level frame at a time, so a request whose frame
+   * has one waits for it. Requests that are ready together go to one agent,
+   * which sees how they relate.
+   */
+  function startAnnotationAgents(watch: AnnotationWatch) {
+    if (watch.runs.length >= MAX_WATCH_AGENTS) return;
+    const busy = new Set(
+      watch.runs.flatMap((run) => run.requests.map((r) => r.top)),
+    );
+    const ready = watch.queue.filter((r) => !busy.has(r.top));
+    if (!ready.length) return;
+    watch.queue = watch.queue.filter((r) => busy.has(r.top));
+    startAnnotationAgent(watch, ready);
+  }
+
+  function startAnnotationAgent(
+    watch: AnnotationWatch,
+    requests: AnnotationRequest[],
+  ) {
+    const number = ++watch.started;
     const count =
       requests.length === 1 ? "1 request" : `${requests.length} requests`;
     const log = createWriteStream(WATCH_LOG, { flags: "a" });
+    // Runs share the log; a tag on each line tells them apart.
     const write = (text: string) => {
-      if (!log.writableEnded) log.write(`${text}\n`);
+      if (log.writableEnded) return;
+      log.write(`${text.replace(/^/gm, `#${number} `)}\n`);
     };
-    write(`\n== ${new Date().toISOString()} "${watch.file}", ${count}`);
+    log.write(
+      `\n== #${number} ${new Date().toISOString()} "${watch.file}", ${count}\n`,
+    );
     // omp gives its shells and kernels the session's file and artifacts dir;
     // the agent runs without a session, so it mustn't inherit them.
     const env = { ...process.env, FIGMA_LABOR_FILE: watch.file };
@@ -2026,12 +2161,14 @@ export default function (pi: ExtensionAPI) {
         "--mode",
         "json",
         "--no-session",
+        ...WATCH_AGENT_ARGS,
         watchMessage(watch.file, requests),
       ],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
     const startedAt = Date.now();
     const run: AgentRun = {
+      number,
       process: agent,
       requests: requests.map((request) => ({ ...request })),
       startedAt,
@@ -2047,7 +2184,7 @@ export default function (pi: ExtensionAPI) {
       stopReason: null,
       done: false,
     };
-    watch.run = run;
+    watch.runs.push(run);
     createInterface({ input: agent.stdout }).on("line", (line) => {
       followAgentLine(run, line, write);
       if (run.done && !run.endTimer) {
@@ -2060,7 +2197,7 @@ export default function (pi: ExtensionAPI) {
         run.endTimer = undefined;
       }
     });
-    agent.stderr.pipe(log, { end: false });
+    createInterface({ input: agent.stderr }).on("line", write);
     let finished = false;
     // "error" (it couldn't start) can be followed by "close"; handle one.
     const finish = (failure: string | null) => {
@@ -2076,8 +2213,8 @@ export default function (pi: ExtensionAPI) {
       );
       log.end();
       // Stopped with the watch, which killed it.
-      if (annotationWatch !== watch || watch.run !== run) return;
-      watch.run = null;
+      if (annotationWatch !== watch || !watch.runs.includes(run)) return;
+      watch.runs = watch.runs.filter((r) => r !== run);
       watch.last = { run, endedAt, failure: reason };
       const message = reason
         ? `The annotation agent stopped in "${watch.file}" after ${took} with ${replied} of ${count} replied: ${reason}. Log: ${WATCH_LOG}. Rerun /figma-labor-watch to retry.`
@@ -2086,7 +2223,7 @@ export default function (pi: ExtensionAPI) {
       watchUi(watch, (ui) =>
         ui.notify([message, ...lines].join("\n"), reason ? "error" : "info"),
       );
-      runAnnotationAgent(watch);
+      startAnnotationAgents(watch);
     };
     agent.on("error", (err) => finish(err.message));
     agent.on("close", (code, signal) => {
@@ -2150,7 +2287,7 @@ export default function (pi: ExtensionAPI) {
     });
     if (fresh.length && annotationWatch === watch) {
       watch.queue.push(...fresh);
-      runAnnotationAgent(watch);
+      startAnnotationAgents(watch);
     }
     return { createdCategory };
   }
@@ -2162,11 +2299,11 @@ export default function (pi: ExtensionAPI) {
     annotationWatch = null;
     clearInterval(watch.timer);
     clearInterval(watch.ticker);
-    if (watch.run) {
-      clearTimeout(watch.run.endTimer);
-      watch.run.process.kill("SIGTERM");
+    for (const run of watch.runs) {
+      clearTimeout(run.endTimer);
+      run.process.kill("SIGTERM");
     }
-    watch.run = null;
+    watch.runs = [];
     watchUi(watch, (ui) => {
       ui.setStatus("labor-watch", undefined);
       ui.setWidget("labor-watch", undefined);
@@ -2431,7 +2568,8 @@ export default function (pi: ExtensionAPI) {
         sent: new Set(),
         warned: new Set(),
         queue: [],
-        run: null,
+        runs: [],
+        started: 0,
         last: null,
         polling: true,
         details: null,
@@ -2464,7 +2602,7 @@ export default function (pi: ExtensionAPI) {
         } finally {
           watch.polling = false;
         }
-      }, 3000);
+      }, WATCH_POLL_MS);
       watch.ticker = setInterval(() => drawWatch(watch), WATCH_TICK_MS);
       drawWatch(watch);
       const created = first.createdCategory
@@ -2515,11 +2653,7 @@ export default function (pi: ExtensionAPI) {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(
-              { target: targetFile, files: status.files },
-              null,
-              2,
-            ),
+            text: formatToolOutput({ target: targetFile, files: status.files }),
           },
         ],
       };
@@ -2569,10 +2703,11 @@ export default function (pi: ExtensionAPI) {
   // ## Selection & navigation
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_get_selection",
     label: "Get Selection",
     description:
-      "Lightweight discovery: get the active editor, page, and currently selected nodes. Always call this first before editor-specific tools.",
+      "Lightweight discovery: get the active editor, page, and currently selected nodes. Call it when the task depends on the selection or editor.",
     parameters: Type.Object({}),
     async execute(_id, _params, signal) {
       return runTool("get_selection", {}, { signal, includeContext: true });
@@ -2606,6 +2741,7 @@ export default function (pi: ExtensionAPI) {
   // ## Reading & inspection
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_get_node",
     label: "Get Node",
     description: "Get a Figma node by ID, including its properties.",
@@ -2646,6 +2782,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_export_node",
     label: "Export Node",
     description: `Export a node as a PNG and return it as an image you can look at, e.g. to check a change when MCP get_screenshot isn't available. The longest side is capped at ${EXPORT_MAX_SIDE}px. Use this instead of exportAsync in labor_run_script: image bytes copied through text get corrupted.`,
@@ -2669,6 +2806,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_run_script",
     label: "Run Script",
     description:
@@ -2691,9 +2829,10 @@ export default function (pi: ExtensionAPI) {
   // ## Annotations
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_get_annotations",
     label: "Get Annotations",
-    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category, or whose text starts with "agent:", are requests for you and carry a status: pending or replied. Each annotation's index is what labor_update_annotations takes. Figma gives plugins no annotations on groups, so those never appear.`,
+    description: `List annotations, the notes and pinned properties attached to nodes in Figma Design and Dev Mode. Searches the current page by default, or the selection, one node and its descendants, or the whole document. Annotations in the "${AGENT_CATEGORY}" category, or whose text starts with "agent:", are requests for you and carry a status: pending or replied; a node with a pending request carries a summary of its type, size, fills, layout, and text. Each annotation's index is what labor_update_annotations takes. Figma gives plugins no annotations on groups, so those never appear.`,
     parameters: Type.Object({
       nodeId: Type.Optional(
         Type.String({ description: "Search this node and its descendants" }),
@@ -2727,6 +2866,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "labor_update_annotations",
     label: "Update Annotations",
     description: `Add, update, remove, or reply to one annotation on a node, leaving its other annotations as they are. "reply" appends a ${AGENT_REPLY_MARK} paragraph to an existing annotation: use it to answer "${AGENT_CATEGORY}" requests; replying to an "agent:" request also files it under "${AGENT_CATEGORY}" and drops the prefix. Use this tool instead of assigning node.annotations in a script, which replaces every annotation on the node.`,

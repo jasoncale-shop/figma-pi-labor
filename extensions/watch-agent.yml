@@ -1,0 +1,19 @@
+# Settings omp's annotation watch agents (/figma-labor-watch) run with, on
+# top of the user's own. Each costs a background run time without helping a
+# designer who only reads the replies.
+
+# The advisor reviews each turn with a second model and wakes a finished
+# agent to answer its notes, which holds up the requests queued behind it.
+advisor:
+  enabled: false
+
+# Stream rules check code style in tool arguments and interrupt the turn on a
+# match; plugin scripts aren't repository code.
+ttsr:
+  enabled: false
+
+# A designer's requests often come minutes apart, past a 5-minute prompt
+# cache. One-hour entries keep the next run's first turn warm: about 2 s to
+# its first token instead of 10 s, for twice the write price.
+providers:
+  cacheRetention: long
