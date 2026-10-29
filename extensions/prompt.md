@@ -11,7 +11,7 @@
 - `labor_list_files` lists connected files; `labor_use_file` picks one by name or connection id
 - With one file connected, the first Labor call pins this agent to it
 - With several connected and none picked, Labor tools refuse; pick the file the user named, never guess
-- One agent per file: agents in the same file share its undo history, selection, and viewport
+- One agent per file: agents in the same file share its undo history, selection, and viewport. The annotation watch is the exception: its agents work in separate frames on one page, without an undo tool
 - Figma MCP tools may describe the file in Figma's active tab instead of your target; trust Labor reads when they disagree
 
 ## Editor routing

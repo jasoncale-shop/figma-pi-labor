@@ -972,7 +972,7 @@ function watchMessage(file: string, requests: AnnotationRequest[]): string {
     `Figma annotation watch: ${count} in the "${AGENT_CATEGORY}" category of "${file}", each with its annotation's full text and a summary of its node. Labor tools already target that file. You run in the background: the designer sees only your replies on the annotations, and your final message goes only to a log, so keep it to one line.`,
     ...lines,
     `Size your effort to each request. A small edit to an existing node (a color, size, radius, spacing, text, or name) needs no skill and no labor_get_annotations call: in one labor_run_script, read what the summary lacks, make the change, and return the changed values as your check; then reply. For new UI, components, prototypes, or changes across a screen, read the matching skill first, build in steps, and check the result with labor_export_node.`,
-    `Reply on each request's annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply. Other background agents may be editing other frames of this file at the same time: revert a mistake of yours by changing it back, not with labor_undo, which undoes the file's latest change whoever made it.`,
+    `Reply on each request's annotation with labor_update_annotations (action "reply"): one line starting "Done:" with what changed, or "Question:" with what you need. Skip any whose last paragraph is already a ${AGENT_REPLY_MARK} reply. Other background agents may be editing other frames on this page at the same time, so you have no undo, which would revert the file's latest change whoever made it: fix a mistake of yours by changing it back. Stay on the requests' page; read nodes elsewhere by id instead of switching pages.`,
   ].join("\n");
 }
 
@@ -2117,17 +2117,20 @@ export default function (pi: ExtensionAPI) {
   /**
    * Hand the queued requests that are ready to a new agent if there's room.
    * One agent works in a top-level frame at a time, so a request whose frame
-   * has one waits for it. Requests that are ready together go to one agent,
-   * which sees how they relate.
+   * has one waits for it, and agents run together only on one page: scripts
+   * read figma.currentPage, which an agent on another page would switch
+   * under them. Requests that are ready together go to one agent, which sees
+   * how they relate.
    */
   function startAnnotationAgents(watch: AnnotationWatch) {
     if (watch.runs.length >= MAX_WATCH_AGENTS) return;
-    const busy = new Set(
-      watch.runs.flatMap((run) => run.requests.map((r) => r.top)),
-    );
-    const ready = watch.queue.filter((r) => !busy.has(r.top));
+    const running = watch.runs.flatMap((run) => run.requests);
+    const busy = new Set(running.map((r) => r.top));
+    const isReady = (r: AnnotationRequest) =>
+      !busy.has(r.top) && running.every((other) => other.page === r.page);
+    const ready = watch.queue.filter(isReady);
     if (!ready.length) return;
-    watch.queue = watch.queue.filter((r) => busy.has(r.top));
+    watch.queue = watch.queue.filter((r) => !isReady(r));
     startAnnotationAgent(watch, ready);
   }
 
@@ -2147,9 +2150,14 @@ export default function (pi: ExtensionAPI) {
     log.write(
       `\n== #${number} ${new Date().toISOString()} "${watch.file}", ${count}\n`,
     );
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      FIGMA_LABOR_FILE: watch.file,
+      // Leaves out labor_undo; see there.
+      FIGMA_LABOR_WATCH: "1",
+    };
     // omp gives its shells and kernels the session's file and artifacts dir;
     // the agent runs without a session, so it mustn't inherit them.
-    const env = { ...process.env, FIGMA_LABOR_FILE: watch.file };
     delete env.PI_SESSION_FILE;
     delete env.PI_SESSION_ID;
     delete env.PI_ARTIFACTS_DIR;
@@ -3446,35 +3454,40 @@ export default function (pi: ExtensionAPI) {
 
   // ## Safety
 
-  pi.registerTool({
-    name: "labor_undo",
-    label: "Undo",
-    description:
-      "Undo the last Figma operation. Call this immediately if a change was wrong.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, signal) {
-      const status = await bridgeStatus();
-      if (!status || status.plugin !== "connected") {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "Plugin not connected — cannot undo.",
-            },
-          ],
-          isError: true,
-        };
-      }
-      try {
-        await bridgeUndo(targetFile);
-        return { content: [{ type: "text" as const, text: "Undo applied." }] };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text" as const, text: `Undo failed: ${msg}` }],
-          isError: true,
-        };
-      }
-    },
-  });
+  // An undo reverts the file's latest change, whoever made it. Watch agents
+  // work beside each other and the user's session, so they get none.
+  if (!process.env.FIGMA_LABOR_WATCH)
+    pi.registerTool({
+      name: "labor_undo",
+      label: "Undo",
+      description:
+        "Undo the last Figma operation. Call this immediately if a change was wrong.",
+      parameters: Type.Object({}),
+      async execute(_id, _params, signal) {
+        const status = await bridgeStatus();
+        if (!status || status.plugin !== "connected") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "Plugin not connected — cannot undo.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        try {
+          await bridgeUndo(targetFile);
+          return {
+            content: [{ type: "text" as const, text: "Undo applied." }],
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `Undo failed: ${msg}` }],
+            isError: true,
+          };
+        }
+      },
+    });
 }
